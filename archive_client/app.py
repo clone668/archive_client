@@ -61,6 +61,7 @@ def compact_name(value: str, limit: int = 40) -> str:
 
 
 STATE_TEXT = {
+    "loading": "读取中",
     "verified": "已验证",
     "cleaned": "已清理",
     "missing": "缺失",
@@ -415,6 +416,10 @@ class ArchiveClientApp(tk.Tk):
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.busy = False
         self.rows: dict[str, ArchiveDayStatus] = {}
+        self.usage: dict[str, dict[str, Any]] = {}
+        self._usage_refreshing: set[str] = set()
+        self._scan_progress_keys: set[tuple[str, ...]] = set()
+        self._scan_progress_total = 0
         self._speed_sample_at: float | None = None
         self._speed_sample_bytes = 0
         self._transfer_speed: float | None = None
@@ -563,6 +568,7 @@ class ArchiveClientApp(tk.Tk):
             self.table.heading(column, text=headings[column])
             self.table.column(column, width=widths[column], anchor="w")
         self.table.tag_configure("ok", foreground=GREEN)
+        self.table.tag_configure("loading", foreground=BLUE)
         self.table.tag_configure("warn", foreground=AMBER)
         self.table.tag_configure("error", foreground=RED)
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
@@ -762,15 +768,34 @@ class ArchiveClientApp(tk.Tk):
     def refresh(self, *, force: bool = False) -> None:
         if self.busy:
             return
-        self._set_busy(True, "正在并行读取双云端清单")
+        self._usage_refreshing = {"google_drive", "r2", "local"}
+        self._scan_progress_keys.clear()
+        self._scan_progress_total = 0
+        self._set_busy(True, "正在读取双云端日期目录")
         self._reset_transfer_metrics()
+        self.progress_detail_var.set(
+            "同时读取 Google Drive、Cloudflare R2 与容量信息"
+        )
         self.progress_percent_var.set("")
         self.progress.configure(mode="indeterminate")
         self.progress.start(12)
-        self._worker(
-            lambda: self.manager.scan_dashboard(force_refresh=force),
-            "scan",
-        )
+        self._render_metrics()
+
+        def report(event: str, payload: Any) -> None:
+            self.events.put(("scan_update", (event, payload)))
+
+        def run() -> None:
+            try:
+                result = self.manager.scan_dashboard(
+                    force_refresh=force,
+                    update=report,
+                )
+            except Exception as exc:
+                self.events.put(("scan_error", exc))
+            else:
+                self.events.put(("scan_complete", result))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _selected_dates(self) -> tuple[str, ...]:
         selected = set(self.table.selection())
@@ -911,6 +936,11 @@ class ArchiveClientApp(tk.Tk):
         )
         self.active_profile_id = self.config_value.profile_id
         self.manager = ArchiveManager(self.config_value, self.credentials)
+        self.rows.clear()
+        self.usage.clear()
+        self.table.delete(*self.table.get_children())
+        for name in ("drive", "r2", "local"):
+            self.metric_vars[name].set("--")
         self.identity_label.configure(
             text=(
                 f"profile={self.config_value.profile_id} · "
@@ -1039,7 +1069,243 @@ class ArchiveClientApp(tk.Tk):
             text="停止自动同步" if self.schedule_installed else "启用自动同步"
         )
 
-    def _handle_scan(
+    def _render_metrics(self) -> None:
+        rows = list(self.rows.values())
+        drive_ok = sum(row.drive.state == "verified" for row in rows)
+        r2_ok = sum(row.r2.state == "verified" for row in rows)
+        local_ok = sum(row.local_state == "verified" for row in rows)
+
+        drive_usage = self.usage.get("google_drive") or {}
+        if "google_drive" in self._usage_refreshing:
+            if drive_usage and not drive_usage.get("error"):
+                drive_metric = (
+                    f"{drive_ok} 日 · 刷新中\n"
+                    f"上次已用 {human_bytes(int(drive_usage.get('used_bytes') or 0))} / "
+                    f"总计 {human_bytes(int(drive_usage.get('total_bytes') or 0))}"
+                )
+            else:
+                drive_metric = f"{drive_ok} 日 · 读取中\n正在读取账号容量"
+        elif drive_usage.get("error"):
+            drive_metric = f"{drive_ok} 日\n容量读取失败"
+        elif not drive_usage:
+            drive_metric = f"{drive_ok} 日\n容量尚未读取"
+        else:
+            drive_metric = (
+                f"{drive_ok} 日 · 已用 "
+                f"{human_bytes(int(drive_usage.get('used_bytes') or 0))}\n"
+                f"总计 {human_bytes(int(drive_usage.get('total_bytes') or 0))} · "
+                f"剩余 {human_bytes(int(drive_usage.get('free_bytes') or 0))}"
+            )
+
+        r2_usage = self.usage.get("r2") or {}
+        if "r2" in self._usage_refreshing:
+            if r2_usage and not r2_usage.get("error"):
+                r2_metric = (
+                    f"{r2_ok} 日 · 刷新中\n"
+                    f"上次 Bucket {human_bytes(int(r2_usage.get('bucket_bytes') or 0))} · "
+                    f"{int(r2_usage.get('bucket_objects') or 0):,} 对象"
+                )
+            else:
+                r2_metric = f"{r2_ok} 日 · 读取中\n正在读取 Bucket 用量"
+        elif r2_usage.get("error"):
+            r2_metric = f"{r2_ok} 日\n用量读取失败"
+        elif not r2_usage:
+            r2_metric = f"{r2_ok} 日\n用量尚未读取"
+        else:
+            r2_metric = (
+                f"{r2_ok} 日 · 归档 "
+                f"{human_bytes(int(r2_usage.get('archive_bytes') or 0))}\n"
+                f"Bucket {human_bytes(int(r2_usage.get('bucket_bytes') or 0))} · "
+                f"{int(r2_usage.get('bucket_objects') or 0):,} 对象"
+            )
+
+        local_usage = self.usage.get("local") or {}
+        if "local" in self._usage_refreshing:
+            if local_usage and not local_usage.get("error"):
+                local_metric = (
+                    f"{local_ok} 日 · 刷新中\n"
+                    f"上次已用 {human_bytes(int(local_usage.get('used_bytes') or 0))} / "
+                    f"总计 {human_bytes(int(local_usage.get('total_bytes') or 0))}"
+                )
+            else:
+                local_metric = f"{local_ok} 日 · 读取中\n正在读取磁盘容量"
+        elif local_usage.get("error"):
+            local_metric = f"{local_ok} 日\n磁盘容量读取失败"
+        elif not local_usage:
+            local_metric = f"{local_ok} 日\n磁盘容量尚未读取"
+        else:
+            local_metric = (
+                f"{local_ok} 日 · 已用 "
+                f"{human_bytes(int(local_usage.get('used_bytes') or 0))}\n"
+                f"总计 {human_bytes(int(local_usage.get('total_bytes') or 0))} · "
+                f"剩余 {human_bytes(int(local_usage.get('free_bytes') or 0))}"
+            )
+
+        self.metric_vars["drive"].set(drive_metric)
+        self.metric_vars["r2"].set(r2_metric)
+        self.metric_vars["local"].set(local_metric)
+
+    def _render_row(self, row: ArchiveDayStatus) -> None:
+        match_text = (
+            "一致"
+            if row.replicas_match is True
+            else "不一致"
+            if row.replicas_match is False
+            else "已核准清理"
+            if row.drive.state == "cleaned" and row.r2.state == "cleaned"
+            else "读取中"
+            if "loading" in (row.drive.state, row.r2.state)
+            else "--"
+        )
+        detail = next(
+            (
+                status.detail
+                for status in (row.drive, row.r2)
+                if status.snapshot is not None
+            ),
+            "正在读取 manifest"
+            if "loading" in (row.drive.state, row.r2.state)
+            else "--",
+        )
+        state_values = (row.drive.state, row.r2.state, row.local_state)
+        tag = (
+            "error"
+            if row.replicas_match is False or "error" in state_values
+            else "loading"
+            if "loading" in state_values
+            else "ok"
+            if (
+                row.replicas_match is True
+                or (row.drive.state == "cleaned" and row.r2.state == "cleaned")
+            )
+            and row.local_state == "verified"
+            else "warn"
+        )
+        values = (
+            row.archive_date,
+            STATE_TEXT.get(row.drive.state, row.drive.state),
+            STATE_TEXT.get(row.r2.state, row.r2.state),
+            match_text,
+            STATE_TEXT.get(row.local_state, row.local_state),
+            detail,
+        )
+        if self.table.exists(row.archive_date):
+            self.table.item(row.archive_date, values=values, tags=(tag,))
+        else:
+            self.table.insert(
+                "", "end", iid=row.archive_date, values=values, tags=(tag,)
+            )
+
+    def _handle_scan_rows(self, rows: list[ArchiveDayStatus]) -> None:
+        selected = set(self.table.selection())
+        current = set(self.table.get_children())
+        incoming = {row.archive_date for row in rows}
+        for archive_date in current - incoming:
+            self.table.delete(archive_date)
+        self.rows = {row.archive_date: row for row in rows}
+        for index, row in enumerate(rows):
+            self._render_row(row)
+            self.table.move(row.archive_date, "", index)
+        retained = tuple(
+            row.archive_date for row in rows if row.archive_date in selected
+        )
+        if retained:
+            self.table.selection_set(*retained)
+        elif rows:
+            self.table.selection_set(rows[0].archive_date)
+
+        self._scan_progress_keys = {
+            ("replica", row.archive_date, remote)
+            for row in rows
+            for remote, status in (
+                ("google_drive", row.drive),
+                ("r2", row.r2),
+            )
+            if status.state == "loading"
+        }
+        self._scan_progress_keys.update(
+            ("usage", name) for name in self._usage_refreshing
+        )
+        self._scan_progress_total = len(self._scan_progress_keys)
+        self.progress.stop()
+        self.progress.configure(mode="determinate", maximum=100, value=0)
+        self.progress_percent_var.set("0%" if self._scan_progress_total else "")
+        self.status_var.set(
+            f"已发现 {len(rows)} 个归档日期，正在逐项校验双云端 manifest"
+        )
+        self.progress_detail_var.set(
+            f"还有 {self._scan_progress_total} 项等待完成"
+            if self._scan_progress_total
+            else "日期状态已读取，正在汇总结果"
+        )
+        self._render_metrics()
+
+    def _mark_scan_item(self, key: tuple[str, ...], label: str) -> None:
+        if key not in self._scan_progress_keys:
+            self.progress_detail_var.set(f"刚完成：{label}")
+            return
+        self._scan_progress_keys.remove(key)
+        completed = self._scan_progress_total - len(self._scan_progress_keys)
+        percent = (
+            completed / self._scan_progress_total * 100
+            if self._scan_progress_total
+            else 100
+        )
+        self.progress.configure(value=percent)
+        self.progress_percent_var.set(f"{percent:.0f}%")
+        self.progress_detail_var.set(
+            f"刚完成：{label} · {completed}/{self._scan_progress_total} 项"
+        )
+
+    def _handle_scan_update(self, event: str, payload: Any) -> None:
+        if event == "date_source":
+            detail = (
+                f"读取失败：{payload['error']}"
+                if payload.get("error")
+                else f"发现 {payload['count']} 个日期"
+            )
+            self.status_var.set("正在读取双云端日期目录")
+            self.progress_detail_var.set(
+                f"刚完成：{payload['label']} 日期目录 · {detail}"
+            )
+            return
+        if event == "rows":
+            self._handle_scan_rows(payload)
+            return
+        if event == "usage":
+            name = payload["name"]
+            self.usage[name] = payload["value"]
+            self._usage_refreshing.discard(name)
+            self._render_metrics()
+            label = {
+                "google_drive": "Google Drive 容量",
+                "r2": "Cloudflare R2 用量",
+                "local": "本地磁盘容量",
+            }.get(name, name)
+            self._mark_scan_item(("usage", name), label)
+            return
+        if event == "replica":
+            archive_date = payload["archive_date"]
+            remote = payload["remote"]
+            row = self.rows.get(archive_date)
+            if row is None:
+                return
+            if remote == "google_drive":
+                row.drive = payload["status"]
+            else:
+                row.r2 = payload["status"]
+            row.replicas_match = payload["replicas_match"]
+            self._render_row(row)
+            self._render_metrics()
+            remote_name = replica_label(remote)
+            state = STATE_TEXT.get(payload["status"].state, payload["status"].state)
+            self.status_var.set("正在逐项读取双云端 manifest")
+            self._mark_scan_item(
+                ("replica", archive_date, remote),
+                f"{remote_name} {archive_date} · {state}",
+            )
+
+    def _handle_scan_complete(
         self,
         result: tuple[
             list[ArchiveDayStatus],
@@ -1048,84 +1314,23 @@ class ArchiveClientApp(tk.Tk):
         ],
     ) -> None:
         rows, errors, usage = result
-        self.table.delete(*self.table.get_children())
-        self.rows = {row.archive_date: row for row in rows}
-        drive_ok = sum(row.drive.state == "verified" for row in rows)
-        r2_ok = sum(row.r2.state == "verified" for row in rows)
-        local_ok = sum(row.local_state == "verified" for row in rows)
-        drive_usage = usage.get("google_drive") or {}
-        if drive_usage.get("error"):
-            drive_metric = f"{drive_ok} 日\n容量读取失败"
-        else:
-            drive_metric = (
-                f"{drive_ok} 日 · 已用 {human_bytes(int(drive_usage.get('used_bytes') or 0))}\n"
-                f"总计 {human_bytes(int(drive_usage.get('total_bytes') or 0))} · "
-                f"剩余 {human_bytes(int(drive_usage.get('free_bytes') or 0))}"
-            )
-        r2_usage = usage.get("r2") or {}
-        if r2_usage.get("error"):
-            r2_metric = f"{r2_ok} 日\n用量读取失败"
-        else:
-            r2_metric = (
-                f"{r2_ok} 日 · 归档 {human_bytes(int(r2_usage.get('archive_bytes') or 0))}\n"
-                f"Bucket {human_bytes(int(r2_usage.get('bucket_bytes') or 0))} · "
-                f"{int(r2_usage.get('bucket_objects') or 0):,} 对象"
-            )
-        local_usage = usage.get("local") or {}
-        if local_usage.get("error"):
-            local_metric = f"{local_ok} 日\n磁盘容量读取失败"
-        else:
-            local_metric = (
-                f"{local_ok} 日 · 已用 {human_bytes(int(local_usage.get('used_bytes') or 0))}\n"
-                f"总计 {human_bytes(int(local_usage.get('total_bytes') or 0))} · "
-                f"剩余 {human_bytes(int(local_usage.get('free_bytes') or 0))}"
-            )
-        self.metric_vars["drive"].set(drive_metric)
-        self.metric_vars["r2"].set(r2_metric)
-        self.metric_vars["local"].set(local_metric)
-        for row in rows:
-            match_text = (
-                "一致"
-                if row.replicas_match is True
-                else "不一致"
-                if row.replicas_match is False
-                else "已核准清理"
-                if row.drive.state == "cleaned" and row.r2.state == "cleaned"
-                else "--"
-            )
-            detail = row.drive.detail if row.drive.snapshot else row.r2.detail
-            state_values = (row.drive.state, row.r2.state, row.local_state)
-            tag = (
-                "error"
-                if row.replicas_match is False or "error" in state_values
-                else "ok"
-                if (
-                    row.replicas_match is True
-                    or (row.drive.state == "cleaned" and row.r2.state == "cleaned")
-                )
-                and row.local_state == "verified"
-                else "warn"
-            )
-            self.table.insert(
-                "",
-                "end",
-                iid=row.archive_date,
-                values=(
-                    row.archive_date,
-                    STATE_TEXT.get(row.drive.state, row.drive.state),
-                    STATE_TEXT.get(row.r2.state, row.r2.state),
-                    match_text,
-                    STATE_TEXT.get(row.local_state, row.local_state),
-                    detail,
-                ),
-                tags=(tag,),
-            )
-        if rows:
-            self.table.selection_set(rows[0].archive_date)
+        self.usage = usage
+        self._usage_refreshing.clear()
+        self._scan_progress_keys.clear()
+        self._render_metrics()
+        self.progress.stop()
+        self.progress.configure(mode="determinate", maximum=100)
+        self._set_busy(False)
+        self.progress.configure(value=100)
+        self.progress_percent_var.set("100%")
         self.status_var.set(
             "；".join(errors)
             if errors
             else f"{self.config_value.display_name}：双云端清单已更新"
+        )
+        verified = sum(row.replicas_match is True for row in rows)
+        self.progress_detail_var.set(
+            f"读取完成：{len(rows)} 个日期 · {verified} 个双副本一致"
         )
 
     def _drain_events(self) -> None:
@@ -1172,11 +1377,21 @@ class ArchiveClientApp(tk.Tk):
                         f"{archive_date} 下载失败，继续处理其余日期"
                     )
                     self.progress_detail_var.set(compact_name(error, 76))
-                elif event == "scan":
+                elif event == "scan_update":
+                    update_event, update_payload = payload
+                    self._handle_scan_update(update_event, update_payload)
+                elif event == "scan_complete":
+                    self._handle_scan_complete(payload)
+                elif event == "scan_error":
+                    self._usage_refreshing.clear()
+                    self._scan_progress_keys.clear()
+                    self._render_metrics()
                     self.progress.stop()
                     self.progress.configure(mode="determinate")
-                    self._handle_scan(payload)
-                    self._set_busy(False)
+                    self._set_busy(False, "双云端清单读取失败")
+                    messagebox.showerror(
+                        "清单读取失败", str(payload), parent=self
+                    )
                 elif event == "download_batch":
                     batch: BatchDownloadResult = payload
                     requested_count = len(batch.requested_dates)
