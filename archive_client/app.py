@@ -940,6 +940,7 @@ class ArchiveClientApp(tk.Tk):
             "local": tk.StringVar(value="--"),
             "schedule": tk.StringVar(value=self._schedule_summary()),
         }
+        self.schedule_detail_var = tk.StringVar()
         self.capacity_bars: dict[str, ttk.Progressbar] = {}
         for index, (name, label) in enumerate(
             (
@@ -954,16 +955,21 @@ class ArchiveClientApp(tk.Tk):
                 row=0,
                 column=index * 2,
                 sticky="ew",
-                padx=(0 if index == 0 else 14, 14 if index < 3 else 0),
+                padx=14,
             )
+            ttk.Label(cell, text=label, style="MetricName.TLabel").pack(anchor="w")
             if name == "schedule":
                 ttk.Label(
                     cell,
                     textvariable=self.metric_vars[name],
                     style="Metric.TLabel",
-                ).pack(anchor="w")
+                ).pack(anchor="w", pady=(3, 0))
+                ttk.Label(
+                    cell,
+                    textvariable=self.schedule_detail_var,
+                    style="MetricNote.TLabel",
+                ).pack(anchor="w", pady=(5, 0))
             elif name == "r2":
-                ttk.Label(cell, text=label, style="MetricName.TLabel").pack(anchor="w")
                 ttk.Label(
                     cell,
                     textvariable=self.metric_vars[name],
@@ -989,7 +995,6 @@ class ArchiveClientApp(tk.Tk):
                 )
                 self.capacity_bars["r2"].pack(fill="x", pady=(5, 0))
             else:
-                ttk.Label(cell, text=label, style="MetricName.TLabel").pack(anchor="w")
                 ttk.Label(
                     cell,
                     textvariable=self.metric_vars[name],
@@ -1010,16 +1015,17 @@ class ArchiveClientApp(tk.Tk):
                     sticky="ns",
                     padx=2,
                 )
-            metrics.columnconfigure(index * 2, weight=1)
+            metrics.columnconfigure(index * 2, weight=1, uniform="metrics")
 
         action_bar = ttk.Frame(self.archive_tab, padding=(0, 10, 0, 10))
         action_bar.grid(row=1, column=0, sticky="ew")
         action_bar.columnconfigure(6, weight=1)
         self.download_button = ttk.Button(
             action_bar,
-            text="↓ 下载选中日期",
+            text="↓ 下载选中",
             style="Primary.TButton",
             command=self.download_selected,
+            state="disabled" if self.schedule_installed else "normal",
         )
         self.download_button.grid(row=0, column=0)
         self.verify_button = ttk.Button(
@@ -1368,13 +1374,13 @@ class ArchiveClientApp(tk.Tk):
         state = "disabled" if value else "normal"
         for button in (
             self.refresh_button,
-            self.download_button,
             self.verify_button,
             self.settings_button,
             self.add_profile_button,
             self.schedule_button,
         ):
             button.configure(state=state)
+        self._update_download_button_state()
         self.cancel_button.configure(
             state="normal"
             if value
@@ -1390,6 +1396,11 @@ class ArchiveClientApp(tk.Tk):
             self._operation_kind = None
             self._active_cancel = None
             self._active_thread = None
+
+    def _update_download_button_state(self) -> None:
+        self.download_button.configure(
+            state="disabled" if self.busy or self.schedule_installed else "normal"
+        )
 
     def _begin_operation(self, kind: str, *, cancelable: bool) -> threading.Event | None:
         self._operation_kind = kind
@@ -1452,14 +1463,15 @@ class ArchiveClientApp(tk.Tk):
 
     def _schedule_summary(self) -> str:
         if not self.schedule_installed:
-            return "自动同步：未启用"
+            return "未启用"
         enabled = sum(profile.enabled for profile in self.profiles)
-        return f"自动同步：已启用 · {enabled} 配置 · 每 30 分钟"
+        return f"已启用 · {enabled} 配置 · 每 30 分钟"
 
     def _start_scheduled_sync(self) -> None:
         started_at = time.time()
         run_task()
         self._scheduled_run_started_at = started_at
+        self.schedule_detail_var.set(f"检查中 · UTC {utc_yesterday()}")
         self.after(2_000, self._poll_scheduled_run)
 
     def _run_startup_sync(self) -> None:
@@ -1474,15 +1486,6 @@ class ArchiveClientApp(tk.Tk):
                 "warning",
             )
             return
-        target_date = utc_yesterday()
-        self._show_result(
-            "启动自动同步检查已开始",
-            (
-                f"正在后台检查所有启用配置的 UTC 日期 {target_date}；"
-                "本地缺失时自动下载，已完整验证时不会重复下载。"
-            ),
-            "success",
-        )
 
     def _poll_scheduled_run(self) -> None:
         started_at = self._scheduled_run_started_at
@@ -1520,10 +1523,8 @@ class ArchiveClientApp(tk.Tk):
             if not item.get("success")
         ]
         if payload.get("success"):
-            self._show_result(
-                "自动同步完成",
-                f"已完成 {len(profiles)} 个启用配置；列表正在刷新。",
-                "success",
+            self.schedule_detail_var.set(
+                f"刚完成 · {len(profiles)} 配置 · 列表刷新中"
             )
         else:
             self._show_result(
@@ -1601,7 +1602,7 @@ class ArchiveClientApp(tk.Tk):
 
     def _on_table_selection(self, _event: tk.Event | None = None) -> None:
         count = len(self.table.selection())
-        text = "↓ 下载选中日期" if count <= 1 else f"↓ 下载选中日期（{count}）"
+        text = "↓ 下载选中" if count <= 1 else f"↓ 下载选中（{count}）"
         self.download_button.configure(text=text)
 
     def _progress_callback(self, name: str, current: int, total: int) -> None:
@@ -1913,6 +1914,8 @@ class ArchiveClientApp(tk.Tk):
         self._startup_sync_pending = False
         self.schedule_toggle_var.set(self.schedule_installed)
         self.metric_vars["schedule"].set(self._schedule_summary())
+        self.schedule_detail_var.set("")
+        self._update_download_button_state()
         if self.schedule_installed:
             target_date = utc_yesterday()
             if first_run_error:
@@ -1922,14 +1925,7 @@ class ArchiveClientApp(tk.Tk):
                     "warning",
                 )
             else:
-                self._show_result(
-                    "自动同步已启用，首次同步已启动",
-                    (
-                        f"正在后台补齐所有启用配置的 UTC 日期 {target_date}。"
-                        "此后每 30 分钟检查一次；本次完成后列表会自动刷新。"
-                    ),
-                    "success",
-                )
+                self.schedule_detail_var.set(f"检查中 · UTC {target_date}")
         else:
             self._show_result("自动同步已停止", "Windows 计划任务已删除。", "success")
 
@@ -2216,6 +2212,11 @@ class ArchiveClientApp(tk.Tk):
             if errors
             else f"{self.config_value.display_name}：双云端清单已更新"
         )
+        schedule_detail = self.schedule_detail_var.get()
+        if not errors and schedule_detail.endswith("列表刷新中"):
+            self.schedule_detail_var.set(
+                schedule_detail.removesuffix("列表刷新中") + "列表已刷新"
+            )
         if errors:
             self._show_result("清单读取完成但有异常", "\n".join(errors), "warning")
         verified = sum(row.replicas_match is True for row in rows)
