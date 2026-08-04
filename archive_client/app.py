@@ -29,7 +29,6 @@ from .scheduler import install_task, remove_task, run_task, task_installed
 
 BG = "#f3f5f7"
 SURFACE = "#ffffff"
-HEADER_BG = "#f8fafb"
 INK = "#18212b"
 MUTED = "#61707f"
 BORDER = "#d7dee5"
@@ -615,7 +614,6 @@ class ArchiveClientApp(tk.Tk):
         if "clam" in style.theme_names():
             style.theme_use("clam")
         style.configure("TFrame", background=BG)
-        style.configure("Header.TFrame", background=HEADER_BG)
         style.configure("Surface.TFrame", background=SURFACE)
         style.configure(
             "TLabel",
@@ -663,7 +661,7 @@ class ArchiveClientApp(tk.Tk):
             foreground=ACCENT,
             font=("Segoe UI", 8),
         )
-        style.configure("Status.TLabel", font=("Segoe UI Semibold", 9), foreground=INK)
+        style.configure("Status.TLabel", font=("Segoe UI", 9), foreground=INK)
         style.configure(
             "Percent.TLabel",
             background=SURFACE,
@@ -697,6 +695,7 @@ class ArchiveClientApp(tk.Tk):
             foreground=[("disabled", "#9aa6b2")],
         )
         style.configure("Dashboard.TButton", font=("Segoe UI", 8), padding=(6, 2))
+        style.configure("TabHeader.TButton", font=("Segoe UI", 8), padding=(8, 3))
         style.configure(
             "Primary.TButton",
             font=("Segoe UI Semibold", 9),
@@ -732,14 +731,14 @@ class ArchiveClientApp(tk.Tk):
             background=BG,
             foreground=MUTED,
             font=("Segoe UI Semibold", 9),
-            padding=(16, 8),
+            padding=(14, 6),
             borderwidth=0,
         )
         style.map(
             "TNotebook.Tab",
             background=[("selected", SURFACE), ("active", "#e9eef1")],
             foreground=[("selected", ACCENT), ("active", INK)],
-            padding=[("selected", (16, 8))],
+            padding=[("selected", (14, 6))],
             expand=[("selected", (0, 0, 0, 0))],
         )
         style.configure("Settings.TNotebook", background=SURFACE, borderwidth=0)
@@ -789,6 +788,11 @@ class ArchiveClientApp(tk.Tk):
             arrowsize=14,
         )
         style.configure(
+            "TabHeader.TCombobox",
+            padding=(6, 3),
+            arrowsize=12,
+        )
+        style.configure(
             "TSpinbox",
             padding=(7, 5),
             fieldbackground=SURFACE,
@@ -821,13 +825,6 @@ class ArchiveClientApp(tk.Tk):
             ],
             foreground=[("selected", GREEN), ("disabled", "#9aa6b2")],
             bordercolor=[("selected", "#bcdcc9"), ("active", BORDER)],
-        )
-        style.configure(
-            "Metrics.Vertical.TSeparator",
-            background=BORDER,
-            bordercolor=BORDER,
-            lightcolor=BORDER,
-            darkcolor=BORDER,
         )
         style.configure(
             "Treeview",
@@ -886,44 +883,56 @@ class ArchiveClientApp(tk.Tk):
 
     def _build(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
 
-        header = ttk.Frame(self, style="Header.TFrame", padding=(14, 8))
-        header.grid(row=0, column=0, sticky="ew")
-        header.columnconfigure(0, weight=1)
+        tab_shell = ttk.Frame(self)
+        tab_shell.grid(
+            row=0,
+            column=0,
+            sticky="nsew",
+            padx=14,
+            pady=(8, 10),
+        )
+        tab_shell.columnconfigure(0, weight=1)
+        tab_shell.rowconfigure(0, weight=1)
 
-        tools = ttk.Frame(header, style="Header.TFrame")
-        tools.grid(row=0, column=0, sticky="e")
-        self.profile_var = tk.StringVar()
-        self.profile_choice_to_id: dict[str, str] = {}
-        self.profile_combo = ttk.Combobox(
-            tools,
-            textvariable=self.profile_var,
-            state="readonly",
-            width=30,
-        )
-        self.profile_combo.grid(row=0, column=0, padx=(0, 8))
-        self.profile_combo.bind("<<ComboboxSelected>>", self._select_profile)
-        self.add_profile_button = ttk.Button(
-            tools, text="+ 新增配置", command=self.new_profile
-        )
-        self.add_profile_button.grid(row=0, column=1, padx=(0, 8))
-        self.refresh_button = ttk.Button(
-            tools,
-            text="↻ 刷新",
-            command=lambda: self.refresh(force=True),
-        )
-        self.refresh_button.grid(row=0, column=2)
-        self._sync_profile_selector()
-
-        self.main_notebook = ttk.Notebook(self)
-        self.main_notebook.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        self.main_notebook = ttk.Notebook(tab_shell)
+        self.main_notebook.grid(row=0, column=0, sticky="nsew")
         self.archive_tab = ttk.Frame(self.main_notebook)
         self.settings_tab = ttk.Frame(self.main_notebook)
         self.main_notebook.add(self.archive_tab, text="归档")
         self.main_notebook.add(self.settings_tab, text="设置")
         self.archive_tab.columnconfigure(0, weight=1)
         self.archive_tab.rowconfigure(3, weight=1)
+
+        tools = ttk.Frame(tab_shell)
+        tools.place(relx=1.0, x=-6, y=2, anchor="ne")
+        self.profile_var = tk.StringVar()
+        self.profile_choice_to_id: dict[str, str] = {}
+        self.profile_combo = ttk.Combobox(
+            tools,
+            textvariable=self.profile_var,
+            state="readonly",
+            style="TabHeader.TCombobox",
+            width=30,
+        )
+        self.profile_combo.grid(row=0, column=0, padx=(0, 6))
+        self.profile_combo.bind("<<ComboboxSelected>>", self._select_profile)
+        self.add_profile_button = ttk.Button(
+            tools,
+            text="+ 新增配置",
+            command=self.new_profile,
+            style="TabHeader.TButton",
+        )
+        self.add_profile_button.grid(row=0, column=1, padx=(0, 6))
+        self.refresh_button = ttk.Button(
+            tools,
+            text="↻ 刷新",
+            command=lambda: self.refresh(force=True),
+            style="TabHeader.TButton",
+        )
+        self.refresh_button.grid(row=0, column=2)
+        self._sync_profile_selector()
 
         metrics = tk.Frame(
             self.archive_tab,
@@ -958,13 +967,18 @@ class ArchiveClientApp(tk.Tk):
             cell = ttk.Frame(metrics, style="Surface.TFrame")
             cell.grid(
                 row=0,
-                column=index * 2,
+                column=index,
                 sticky="nsew",
                 padx=14,
             )
             cell.columnconfigure(0, weight=1)
-            cell_header = ttk.Frame(cell, style="Surface.TFrame")
+            cell_header = ttk.Frame(
+                cell,
+                style="Surface.TFrame",
+                height=24,
+            )
             cell_header.grid(row=0, column=0, sticky="ew")
+            cell_header.pack_propagate(False)
             ttk.Label(
                 cell_header, text=label, style="DashboardTitle.TLabel"
             ).pack(side="left", anchor="w")
@@ -1028,18 +1042,7 @@ class ArchiveClientApp(tk.Tk):
                 )
                 bar_slot.pack_propagate(False)
                 self.capacity_bars[name].pack(fill="both", expand=True)
-            if index < 3:
-                ttk.Separator(
-                    metrics,
-                    orient="vertical",
-                    style="Metrics.Vertical.TSeparator",
-                ).grid(
-                    row=0,
-                    column=index * 2 + 1,
-                    sticky="ns",
-                    padx=2,
-                )
-            metrics.columnconfigure(index * 2, weight=1, uniform="metrics")
+            metrics.columnconfigure(index, weight=1, uniform="metrics")
 
         action_bar = ttk.Frame(self.archive_tab, padding=(0, 10, 0, 10))
         action_bar.grid(row=1, column=0, sticky="ew")
@@ -1140,7 +1143,7 @@ class ArchiveClientApp(tk.Tk):
             "detail": 320,
         }
         for column in columns:
-            self.table.heading(column, text=headings[column])
+            self.table.heading(column, text=headings[column], anchor="w")
             self.table.column(
                 column,
                 width=widths[column],
@@ -1193,11 +1196,18 @@ class ArchiveClientApp(tk.Tk):
             style="Percent.TLabel",
             anchor="e",
         ).grid(row=0, column=1, sticky="e", padx=(12, 0))
-        self.progress = ttk.Progressbar(
+        progress_slot = ttk.Frame(
             status_bar,
+            style="Surface.TFrame",
+            height=7,
+        )
+        progress_slot.grid(row=1, column=0, sticky="ew")
+        progress_slot.pack_propagate(False)
+        self.progress = ttk.Progressbar(
+            progress_slot,
             mode="determinate",
         )
-        self.progress.grid(row=1, column=0, sticky="ew")
+        self.progress.pack(fill="both", expand=True)
 
         self.settings_panel: SettingsPanel | None = None
         self._mount_settings_panel(self.config_value)
@@ -2219,7 +2229,7 @@ class ArchiveClientApp(tk.Tk):
         self.status_var.set(
             "；".join(errors)
             if errors
-            else f"{self.config_value.display_name}：双云端清单已更新"
+            else "双云端清单已更新"
         )
         schedule_detail = self.schedule_detail_var.get()
         if not errors and schedule_detail.endswith("列表刷新中"):
