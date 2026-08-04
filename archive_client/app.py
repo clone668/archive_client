@@ -652,7 +652,12 @@ class ArchiveClientApp(tk.Tk):
         )
         style.configure("MetricName.TLabel", background=SURFACE, foreground=MUTED, font=("Segoe UI", 8))
         style.configure("Status.TLabel", font=("Segoe UI Semibold", 9), foreground=INK)
-        style.configure("Percent.TLabel", font=("Segoe UI Semibold", 9), foreground=ACCENT)
+        style.configure(
+            "Percent.TLabel",
+            background=SURFACE,
+            font=("Segoe UI Semibold", 9),
+            foreground=ACCENT,
+        )
         style.configure(
             "ResultTitle.TLabel",
             background=SURFACE,
@@ -787,7 +792,7 @@ class ArchiveClientApp(tk.Tk):
         style.layout("Sync.Toolbutton", style.layout("Toolbutton"))
         style.configure(
             "Sync.Toolbutton",
-            background=BG,
+            background=SURFACE,
             foreground=INK,
             font=("Segoe UI", 9),
             padding=(10, 6),
@@ -838,6 +843,7 @@ class ArchiveClientApp(tk.Tk):
         for name, color in (
             ("Drive", "#4285f4"),
             ("R2", "#f48120"),
+            ("Local", GREEN),
         ):
             style.configure(
                 f"{name}.Horizontal.TProgressbar",
@@ -906,16 +912,12 @@ class ArchiveClientApp(tk.Tk):
             tools, text="+ 新增配置", command=self.new_profile
         )
         self.add_profile_button.grid(row=0, column=1, padx=(0, 8))
-        self.settings_button = ttk.Button(
-            tools, text="⚙ 设置", command=self.open_settings
-        )
-        self.settings_button.grid(row=0, column=2, padx=(0, 8))
         self.refresh_button = ttk.Button(
             tools,
             text="↻ 刷新",
             command=lambda: self.refresh(force=True),
         )
-        self.refresh_button.grid(row=0, column=3)
+        self.refresh_button.grid(row=0, column=2)
         self._sync_profile_selector()
 
         self.main_notebook = ttk.Notebook(self)
@@ -941,6 +943,7 @@ class ArchiveClientApp(tk.Tk):
             "schedule": tk.StringVar(value=self._schedule_summary()),
         }
         self.schedule_detail_var = tk.StringVar()
+        self.schedule_toggle_var = tk.BooleanVar(value=self.schedule_installed)
         self.capacity_bars: dict[str, ttk.Progressbar] = {}
         for index, (name, label) in enumerate(
             (
@@ -969,6 +972,14 @@ class ArchiveClientApp(tk.Tk):
                     textvariable=self.schedule_detail_var,
                     style="MetricNote.TLabel",
                 ).pack(anchor="w", pady=(5, 0))
+                self.schedule_button = ttk.Checkbutton(
+                    cell,
+                    text="↻ 自动同步",
+                    variable=self.schedule_toggle_var,
+                    command=self.toggle_schedule,
+                    style="Sync.Toolbutton",
+                )
+                self.schedule_button.pack(anchor="w", pady=(8, 0))
             elif name == "r2":
                 ttk.Label(
                     cell,
@@ -1008,6 +1019,20 @@ class ArchiveClientApp(tk.Tk):
                         maximum=100,
                     )
                     self.capacity_bars["drive"].pack(fill="x", pady=(5, 0))
+                elif name == "local":
+                    self.capacity_bars["local"] = ttk.Progressbar(
+                        cell,
+                        style="Local.Horizontal.TProgressbar",
+                        mode="determinate",
+                        maximum=100,
+                    )
+                    self.capacity_bars["local"].pack(fill="x", pady=(5, 0))
+                    self.local_button = ttk.Button(
+                        cell,
+                        text="▣ 打开本地目录",
+                        command=self.open_local_root,
+                    )
+                    self.local_button.pack(anchor="w", pady=(8, 0))
             if index < 3:
                 ttk.Separator(metrics, orient="vertical").grid(
                     row=0,
@@ -1019,11 +1044,9 @@ class ArchiveClientApp(tk.Tk):
 
         action_bar = ttk.Frame(self.archive_tab, padding=(0, 10, 0, 10))
         action_bar.grid(row=1, column=0, sticky="ew")
-        action_bar.columnconfigure(6, weight=1)
         self.download_button = ttk.Button(
             action_bar,
             text="↓ 下载选中",
-            style="Primary.TButton",
             command=self.download_selected,
             state="disabled" if self.schedule_installed else "normal",
         )
@@ -1043,19 +1066,6 @@ class ArchiveClientApp(tk.Tk):
             action_bar, text="≡ 打开报告", command=self.open_reports
         )
         self.reports_button.grid(row=0, column=3, padx=(8, 0))
-        self.local_button = ttk.Button(
-            action_bar, text="▣ 打开本地目录", command=self.open_local_root
-        )
-        self.local_button.grid(row=0, column=4, padx=(8, 0))
-        self.schedule_toggle_var = tk.BooleanVar(value=self.schedule_installed)
-        self.schedule_button = ttk.Checkbutton(
-            action_bar,
-            text="↻ 自动同步",
-            variable=self.schedule_toggle_var,
-            command=self.toggle_schedule,
-            style="Sync.Toolbutton",
-        )
-        self.schedule_button.grid(row=0, column=7, sticky="e")
 
         self.result_frame = tk.Frame(
             self.archive_tab,
@@ -1375,7 +1385,6 @@ class ArchiveClientApp(tk.Tk):
         for button in (
             self.refresh_button,
             self.verify_button,
-            self.settings_button,
             self.add_profile_button,
             self.schedule_button,
         ):
@@ -2014,11 +2023,16 @@ class ArchiveClientApp(tk.Tk):
         drive_total = int(drive_usage.get("total_bytes") or 0)
         drive_used = int(drive_usage.get("used_bytes") or 0)
         r2_used = int(r2_usage.get("bucket_bytes") or 0)
+        local_total = int(local_usage.get("total_bytes") or 0)
+        local_used = int(local_usage.get("used_bytes") or 0)
         self.capacity_bars["drive"].configure(
             value=min(drive_used / drive_total * 100, 100) if drive_total else 0
         )
         self.capacity_bars["r2"].configure(
             value=min(r2_used / R2_FREE_ALLOWANCE_BYTES * 100, 100)
+        )
+        self.capacity_bars["local"].configure(
+            value=min(local_used / local_total * 100, 100) if local_total else 0
         )
 
     def _render_row(
