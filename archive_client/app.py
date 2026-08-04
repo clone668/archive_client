@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -995,8 +996,10 @@ class ArchiveClientApp(tk.Tk):
         self.main_notebook = ttk.Notebook(tab_shell)
         self.main_notebook.grid(row=0, column=0, sticky="nsew")
         self.archive_tab = ttk.Frame(self.main_notebook)
+        self.report_tab = ttk.Frame(self.main_notebook)
         self.settings_tab = ttk.Frame(self.main_notebook)
         self.main_notebook.add(self.archive_tab, text="归档")
+        self.main_notebook.add(self.report_tab, text="报告")
         self.main_notebook.add(self.settings_tab, text="设置")
         self.archive_tab.columnconfigure(0, weight=1)
         self.archive_tab.rowconfigure(3, weight=1)
@@ -1025,7 +1028,7 @@ class ArchiveClientApp(tk.Tk):
         self.refresh_button = ttk.Button(
             tools,
             text="↻ 刷新",
-            command=lambda: self.refresh(force=True),
+            command=self._refresh_current_tab,
             style="TabHeader.TButton",
         )
         self.refresh_button.grid(row=0, column=2)
@@ -1161,10 +1164,6 @@ class ArchiveClientApp(tk.Tk):
             state="disabled",
         )
         self.cancel_button.grid(row=0, column=2, padx=(8, 0))
-        self.reports_button = ttk.Button(
-            action_bar, text="≡ 打开报告", command=self.open_reports
-        )
-        self.reports_button.grid(row=0, column=3, padx=(8, 0))
 
         self.result_frame = tk.Frame(
             self.archive_tab,
@@ -1303,8 +1302,483 @@ class ArchiveClientApp(tk.Tk):
         self.progress = ThinProgressbar(progress_slot)
         self.progress.pack(fill="both", expand=True)
 
+        self._build_report_tab()
         self.settings_panel: SettingsPanel | None = None
         self._mount_settings_panel(self.config_value)
+        self.main_notebook.bind("<<NotebookTabChanged>>", self._on_main_tab_changed)
+
+    def _build_report_tab(self) -> None:
+        self.report_tab.columnconfigure(0, weight=1)
+        self.report_tab.rowconfigure(3, weight=1)
+        self.report_records: dict[str, dict[str, Any]] = {}
+
+        toolbar = ttk.Frame(self.report_tab, padding=(8, 10, 8, 8))
+        toolbar.grid(row=0, column=0, sticky="ew")
+        toolbar.columnconfigure(0, weight=1)
+        self.report_status_var = tk.StringVar(value="尚未读取报告")
+        ttk.Label(
+            toolbar,
+            textvariable=self.report_status_var,
+            style="Muted.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self.open_report_file_button = ttk.Button(
+            toolbar,
+            text="↗ 打开文件",
+            command=self.open_selected_report_file,
+            state="disabled",
+        )
+        self.open_report_file_button.grid(row=0, column=1, padx=(8, 0))
+        self.open_report_directory_button = ttk.Button(
+            toolbar,
+            text="▣ 打开目录",
+            command=self.open_report_directory,
+        )
+        self.open_report_directory_button.grid(row=0, column=2, padx=(8, 0))
+
+        report_list_frame = ttk.Frame(self.report_tab, style="Surface.TFrame")
+        report_list_frame.grid(row=1, column=0, sticky="ew")
+        report_list_frame.columnconfigure(0, weight=1)
+        self.report_table = ttk.Treeview(
+            report_list_frame,
+            columns=("date", "type", "status", "objects", "rows", "verified_at"),
+            show="headings",
+            selectmode="browse",
+            height=5,
+        )
+        report_headings = {
+            "date": "UTC 日期",
+            "type": "报告类型",
+            "status": "状态",
+            "objects": "对象数",
+            "rows": "总行数",
+            "verified_at": "生成时间",
+        }
+        report_widths = {
+            "date": 120,
+            "type": 120,
+            "status": 110,
+            "objects": 90,
+            "rows": 130,
+            "verified_at": 220,
+        }
+        for column in report_headings:
+            self.report_table.heading(
+                column,
+                text=report_headings[column],
+                anchor="w",
+            )
+            self.report_table.column(
+                column,
+                width=report_widths[column],
+                minwidth=80,
+                anchor="w",
+                stretch=column == "verified_at",
+            )
+        self.report_table.tag_configure("ok", foreground=INK)
+        self.report_table.tag_configure("warn", foreground=AMBER)
+        self.report_table.tag_configure("error", foreground=RED)
+        report_scrollbar = ttk.Scrollbar(
+            report_list_frame,
+            orient="vertical",
+            command=self.report_table.yview,
+        )
+        self.report_table.configure(yscrollcommand=report_scrollbar.set)
+        self.report_table.grid(row=0, column=0, sticky="ew")
+        report_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.report_table.bind("<<TreeviewSelect>>", self._on_report_selection)
+        self.report_table.bind(
+            "<Double-1>",
+            lambda _event: self.open_selected_report_file(),
+        )
+
+        summary = ttk.Frame(
+            self.report_tab,
+            style="Surface.TFrame",
+            padding=(12, 8),
+        )
+        summary.grid(row=2, column=0, sticky="ew", pady=(6, 6))
+        summary.columnconfigure(0, weight=1)
+        self.report_summary_var = tk.StringVar(value="请选择一份报告")
+        ttk.Label(
+            summary,
+            textvariable=self.report_summary_var,
+            style="Status.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self.report_meta_var = tk.StringVar()
+        ttk.Label(
+            summary,
+            textvariable=self.report_meta_var,
+            style="MetricName.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        detail_frame = ttk.Frame(self.report_tab, style="Surface.TFrame")
+        detail_frame.grid(row=3, column=0, sticky="nsew")
+        detail_frame.columnconfigure(0, weight=1)
+        detail_frame.rowconfigure(0, weight=1)
+        detail_columns = ("kind", "name", "path", "rows", "size", "digest")
+        self.report_detail_table = ttk.Treeview(
+            detail_frame,
+            columns=detail_columns,
+            show="headings",
+            selectmode="browse",
+        )
+        detail_scrollbar = ttk.Scrollbar(
+            detail_frame,
+            orient="vertical",
+            command=self.report_detail_table.yview,
+        )
+        self.report_detail_table.configure(yscrollcommand=detail_scrollbar.set)
+        self.report_detail_table.grid(row=0, column=0, sticky="nsew")
+        detail_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.report_detail_table.tag_configure("stripe_even", background=SURFACE)
+        self.report_detail_table.tag_configure("stripe_odd", background="#f5f7f9")
+        self._configure_report_detail_columns(objects=True)
+
+        self.report_path_var = tk.StringVar()
+        ttk.Label(
+            self.report_tab,
+            textvariable=self.report_path_var,
+            style="Muted.TLabel",
+            anchor="w",
+        ).grid(row=4, column=0, sticky="ew", padx=10, pady=(5, 6))
+
+        self.refresh_reports()
+
+    def _refresh_current_tab(self) -> None:
+        if self.main_notebook.select() == str(self.report_tab):
+            self.refresh_reports()
+            return
+        self.refresh(force=True)
+
+    def _on_main_tab_changed(self, _event: tk.Event | None = None) -> None:
+        if self.main_notebook.select() == str(self.report_tab):
+            self.refresh_reports()
+
+    def _report_root(self) -> Path:
+        return (
+            self.config_value.archive_root
+            / "reports"
+            / f"collector={self.config_value.collector_id}"
+        )
+
+    @staticmethod
+    def _report_type(path: Path) -> str:
+        name = path.name
+        if name.startswith("verify-"):
+            return "完整校验"
+        if name.startswith("plan-"):
+            return "清理计划"
+        if name.startswith("checkpoint-r2-"):
+            return "R2 检查点"
+        if name.startswith("receipt-"):
+            return "清理回执"
+        return "JSON 报告"
+
+    @staticmethod
+    def _report_timestamp(value: Any, fallback: float) -> str:
+        text = str(value or "").strip()
+        match = re.match(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})", text)
+        if match:
+            return f"{match.group(1)} {match.group(2)} UTC"
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(fallback)) + " UTC"
+
+    @staticmethod
+    def _report_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+    @staticmethod
+    def _report_state(report_type: str, payload: dict[str, Any]) -> tuple[str, str]:
+        status = str(payload.get("status") or "").strip().lower()
+        if status == "verified":
+            return "✓ 已验证", "ok"
+        if report_type == "清理回执":
+            return "✓ 已完成", "ok"
+        if report_type == "R2 检查点":
+            return "✓ 已确认", "ok"
+        if report_type == "清理计划":
+            return "○ 待处理", "warn"
+        return (status or "已读取"), "ok"
+
+    def refresh_reports(self) -> None:
+        selected_path = ""
+        selected = self.report_table.selection()
+        if selected:
+            selected_path = str(
+                self.report_records.get(selected[0], {}).get("path") or ""
+            )
+
+        self.report_table.delete(*self.report_table.get_children())
+        self.report_records.clear()
+        self.report_detail_table.delete(*self.report_detail_table.get_children())
+        self.open_report_file_button.configure(state="disabled")
+        self.report_summary_var.set("请选择一份报告")
+        self.report_meta_var.set("")
+        self.report_path_var.set("")
+
+        root = self._report_root()
+        try:
+            paths = sorted(
+                root.rglob("*.json") if root.is_dir() else (),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError as exc:
+            self.report_status_var.set(f"报告目录读取失败：{exc}")
+            return
+
+        selected_iid = ""
+        invalid_count = 0
+        for index, path in enumerate(paths):
+            payload: dict[str, Any] = {}
+            error = ""
+            try:
+                if path.stat().st_size > 8 * 1024 * 1024:
+                    raise RuntimeError("报告文件超过 8 MB")
+                parsed = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(parsed, dict):
+                    raise RuntimeError("报告根节点不是 JSON 对象")
+                payload = parsed
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError) as exc:
+                error = str(exc)
+                invalid_count += 1
+
+            report_type = self._report_type(path)
+            match = re.search(r"\d{4}-\d{2}-\d{2}", path.name)
+            archive_date = str(payload.get("archive_date") or "")
+            if not archive_date and match:
+                archive_date = match.group(0)
+            state, tag = (
+                ("! 异常", "error")
+                if error
+                else self._report_state(report_type, payload)
+            )
+            objects = payload.get("objects")
+            object_count = self._report_int(
+                payload.get("object_count"),
+                len(objects) if isinstance(objects, list) else 0,
+            )
+            row_count = self._report_int(payload.get("row_count"))
+            generated_at = next(
+                (
+                    payload.get(key)
+                    for key in (
+                        "verified_at",
+                        "completed_at",
+                        "generated_at",
+                        "created_at",
+                    )
+                    if payload.get(key)
+                ),
+                None,
+            )
+            iid = f"report-{index}"
+            record = {
+                "path": path,
+                "payload": payload,
+                "error": error,
+                "type": report_type,
+                "date": archive_date or "--",
+                "state": state,
+                "tag": tag,
+            }
+            self.report_records[iid] = record
+            self.report_table.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    record["date"],
+                    report_type,
+                    state,
+                    f"{object_count:,}" if object_count else "--",
+                    f"{row_count:,}" if row_count else "--",
+                    self._report_timestamp(generated_at, path.stat().st_mtime),
+                ),
+                tags=(tag,),
+            )
+            if str(path) == selected_path:
+                selected_iid = iid
+
+        valid_count = len(paths) - invalid_count
+        self.report_status_var.set(
+            f"{len(paths)} 份报告 · {valid_count} 可读取"
+            + (f" · {invalid_count} 异常" if invalid_count else "")
+        )
+        if not paths:
+            self.report_summary_var.set("当前配置没有本地报告")
+            self.report_meta_var.set(str(root))
+            return
+        target = selected_iid or self.report_table.get_children()[0]
+        self.report_table.selection_set(target)
+        self.report_table.focus(target)
+        self.report_table.see(target)
+        self._on_report_selection()
+
+    def _configure_report_detail_columns(self, *, objects: bool) -> None:
+        if objects:
+            headings = {
+                "kind": "类型",
+                "name": "表名",
+                "path": "归档对象",
+                "rows": "行数",
+                "size": "大小",
+                "digest": "SHA-256",
+            }
+            widths = {
+                "kind": 80,
+                "name": 160,
+                "path": 360,
+                "rows": 100,
+                "size": 100,
+                "digest": 150,
+            }
+            self.report_detail_table.configure(displaycolumns=tuple(headings))
+            for column, heading in headings.items():
+                self.report_detail_table.heading(column, text=heading, anchor="w")
+                self.report_detail_table.column(
+                    column,
+                    width=widths[column],
+                    minwidth=70,
+                    anchor="w",
+                    stretch=column == "path",
+                )
+            return
+
+        self.report_detail_table.configure(displaycolumns=("name", "path"))
+        self.report_detail_table.heading("name", text="字段", anchor="w")
+        self.report_detail_table.heading("path", text="值", anchor="w")
+        self.report_detail_table.column(
+            "name", width=220, minwidth=140, anchor="w", stretch=False
+        )
+        self.report_detail_table.column(
+            "path", width=700, minwidth=300, anchor="w", stretch=True
+        )
+
+    def _on_report_selection(self, _event: tk.Event | None = None) -> None:
+        selected = self.report_table.selection()
+        if not selected:
+            return
+        record = self.report_records.get(selected[0])
+        if not record:
+            return
+        path = Path(record["path"])
+        payload = record["payload"]
+        error = str(record["error"] or "")
+        self.open_report_file_button.configure(
+            state="normal" if path.is_file() else "disabled"
+        )
+        self.report_path_var.set(str(path))
+        self.report_detail_table.delete(*self.report_detail_table.get_children())
+        if error:
+            self.report_summary_var.set(f"{record['date']} · 报告读取异常")
+            self.report_meta_var.set(error)
+            self._configure_report_detail_columns(objects=False)
+            return
+
+        objects = payload.get("objects")
+        object_rows = (
+            [item for item in objects if isinstance(item, dict)]
+            if isinstance(objects, list)
+            else []
+        )
+        if object_rows:
+            self._configure_report_detail_columns(objects=True)
+            total_bytes = sum(
+                self._report_int(item.get("size_bytes")) for item in object_rows
+            )
+            source = str(payload.get("download_replica") or "")
+            source_text = replica_label(source) if source else "本地校验"
+            match = payload.get("replicas_match")
+            match_text = (
+                "双副本一致"
+                if match is True
+                else "双副本不一致"
+                if match is False
+                else "云端已清理"
+            )
+            warnings = payload.get("warnings")
+            warning_count = len(warnings) if isinstance(warnings, list) else 0
+            self.report_summary_var.set(
+                f"{record['date']} · {record['state']} · "
+                f"{len(object_rows):,} 个对象 · "
+                f"{self._report_int(payload.get('row_count')):,} 行"
+            )
+            meta = (
+                f"{human_bytes(total_bytes)} · 来源 {source_text} · {match_text}"
+            )
+            if warning_count:
+                meta += f" · {warning_count} 条警告"
+            self.report_meta_var.set(meta)
+            kind_labels = {
+                "business": "业务",
+                "control": "控制",
+                "evidence": "证据",
+                "raw": "原始",
+            }
+            for index, item in enumerate(object_rows):
+                if not isinstance(item, dict):
+                    continue
+                digest = str(item.get("sha256") or "")
+                self.report_detail_table.insert(
+                    "",
+                    "end",
+                    values=(
+                        kind_labels.get(str(item.get("kind") or ""), item.get("kind") or "--"),
+                        item.get("table_name") or "--",
+                        item.get("relative_key") or "--",
+                        f"{self._report_int(item.get('row_count')):,}",
+                        human_bytes(self._report_int(item.get("size_bytes"))),
+                        digest[:16] + "…" if len(digest) > 16 else digest,
+                    ),
+                    tags=("stripe_odd" if index % 2 else "stripe_even",),
+                )
+            return
+
+        self._configure_report_detail_columns(objects=False)
+        self.report_summary_var.set(
+            f"{record['date']} · {record['type']} · {record['state']}"
+        )
+        self.report_meta_var.set("结构化报告字段")
+        for index, (name, value) in enumerate(sorted(payload.items())):
+            display = (
+                json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                if isinstance(value, (dict, list))
+                else str(value)
+            )
+            self.report_detail_table.insert(
+                "",
+                "end",
+                values=("", name, compact_name(display, 180), "", "", ""),
+                tags=("stripe_odd" if index % 2 else "stripe_even",),
+            )
+
+    def open_report_directory(self) -> None:
+        try:
+            root = self._report_root()
+            root.mkdir(parents=True, exist_ok=True)
+            os.startfile(root)
+        except Exception as exc:
+            self.report_summary_var.set("无法打开报告目录")
+            self.report_meta_var.set(str(exc))
+
+    def open_selected_report_file(self) -> None:
+        selected = self.report_table.selection()
+        if not selected:
+            return
+        record = self.report_records.get(selected[0])
+        if not record:
+            return
+        path = Path(record["path"])
+        try:
+            if not path.is_file():
+                raise RuntimeError("报告文件不存在")
+            os.startfile(path)
+        except Exception as exc:
+            self.report_summary_var.set("无法打开报告文件")
+            self.report_meta_var.set(str(exc))
 
     def _show_result(
         self, title: str, detail: str = "", severity: str = "info"
@@ -1906,6 +2380,7 @@ class ArchiveClientApp(tk.Tk):
         self.rows.clear()
         self.usage.clear()
         self.table.delete(*self.table.get_children())
+        self.refresh_reports()
         for name in ("drive", "r2", "local"):
             self.metric_vars[name].set("--")
             self.metric_vars[f"{name}_detail"].set("正在读取")
@@ -1978,15 +2453,6 @@ class ArchiveClientApp(tk.Tk):
             select_settings=True,
             settings_severity=severity,
         )
-
-    def open_reports(self) -> None:
-        path = (
-            self.config_value.archive_root
-            / "reports"
-            / f"collector={self.config_value.collector_id}"
-        )
-        path.mkdir(parents=True, exist_ok=True)
-        os.startfile(path)
 
     def open_local_root(self) -> None:
         try:
