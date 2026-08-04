@@ -43,6 +43,7 @@ PALE_BLUE = "#eaf4f7"
 PALE_GREEN = "#eaf6ef"
 PALE_AMBER = "#fff7df"
 PALE_RED = "#fff0ee"
+R2_FREE_ALLOWANCE_BYTES = 10 * 1024**3
 LOGGER = logging.getLogger(__name__)
 
 
@@ -897,10 +898,19 @@ class ArchiveClientApp(tk.Tk):
                 sticky="ew",
                 padx=(0 if index == 0 else 14, 14 if index < 3 else 0),
             )
-            ttk.Label(cell, text=label, style="MetricName.TLabel").pack(anchor="w")
-            ttk.Label(cell, textvariable=self.metric_vars[name], style="Metric.TLabel").pack(
-                anchor="w", pady=(3, 0)
-            )
+            if name == "schedule":
+                ttk.Label(
+                    cell,
+                    textvariable=self.metric_vars[name],
+                    style="Metric.TLabel",
+                ).pack(anchor="w")
+            else:
+                ttk.Label(cell, text=label, style="MetricName.TLabel").pack(anchor="w")
+                ttk.Label(
+                    cell,
+                    textvariable=self.metric_vars[name],
+                    style="Metric.TLabel",
+                ).pack(anchor="w", pady=(3, 0))
             if index < 3:
                 ttk.Separator(metrics, orient="vertical").grid(
                     row=0,
@@ -1334,9 +1344,9 @@ class ArchiveClientApp(tk.Tk):
 
     def _schedule_summary(self) -> str:
         if not self.schedule_installed:
-            return "未启用"
+            return "自动同步：未启用"
         enabled = sum(profile.enabled for profile in self.profiles)
-        return f"已启用 · {enabled} 配置 · 每 30 分钟"
+        return f"自动同步：已启用 · {enabled} 配置 · 每 30 分钟"
 
     def _poll_scheduled_run(self) -> None:
         started_at = self._scheduled_run_started_at
@@ -1812,30 +1822,39 @@ class ArchiveClientApp(tk.Tk):
             drive_metric = (
                 f"{drive_ok} 日 · 已用 "
                 f"{human_bytes(int(drive_usage.get('used_bytes') or 0))}\n"
-                f"总计 {human_bytes(int(drive_usage.get('total_bytes') or 0))} · "
-                f"剩余 {human_bytes(int(drive_usage.get('free_bytes') or 0))}"
+                f"总计 {human_bytes(int(drive_usage.get('total_bytes') or 0))}"
             )
 
         r2_usage = self.usage.get("r2") or {}
         if "r2" in self._usage_refreshing:
             if r2_usage and not r2_usage.get("error"):
                 r2_metric = (
-                    f"{r2_ok} 日 · 刷新中\n"
-                    f"上次 Bucket {human_bytes(int(r2_usage.get('bucket_bytes') or 0))} · "
-                    f"{int(r2_usage.get('bucket_objects') or 0):,} 对象"
+                    f"{r2_ok} 日 · 刷新中 · "
+                    f"{int(r2_usage.get('bucket_objects') or 0):,} 对象\n"
+                    f"上次已用 {human_bytes(int(r2_usage.get('bucket_bytes') or 0))} / "
+                    f"免费额度 {human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
                 )
             else:
-                r2_metric = f"{r2_ok} 日 · 读取中\n正在读取 Bucket 用量"
+                r2_metric = (
+                    f"{r2_ok} 日 · 读取中\n"
+                    f"免费额度 {human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
+                )
         elif r2_usage.get("error"):
-            r2_metric = f"{r2_ok} 日\n用量读取失败"
+            r2_metric = (
+                f"{r2_ok} 日 · 用量读取失败\n"
+                f"免费额度 {human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
+            )
         elif not r2_usage:
-            r2_metric = f"{r2_ok} 日\n用量尚未读取"
+            r2_metric = (
+                f"{r2_ok} 日 · 用量尚未读取\n"
+                f"免费额度 {human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
+            )
         else:
             r2_metric = (
-                f"{r2_ok} 日 · 归档 "
-                f"{human_bytes(int(r2_usage.get('archive_bytes') or 0))}\n"
-                f"Bucket {human_bytes(int(r2_usage.get('bucket_bytes') or 0))} · "
-                f"{int(r2_usage.get('bucket_objects') or 0):,} 对象"
+                f"{r2_ok} 日 · {int(r2_usage.get('bucket_objects') or 0):,} 对象 · "
+                f"归档 {human_bytes(int(r2_usage.get('archive_bytes') or 0))}\n"
+                f"已用 {human_bytes(int(r2_usage.get('bucket_bytes') or 0))} / "
+                f"免费额度 {human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
             )
 
         local_usage = self.usage.get("local") or {}
@@ -1856,8 +1875,7 @@ class ArchiveClientApp(tk.Tk):
             local_metric = (
                 f"{local_ok} 日 · 已用 "
                 f"{human_bytes(int(local_usage.get('used_bytes') or 0))}\n"
-                f"总计 {human_bytes(int(local_usage.get('total_bytes') or 0))} · "
-                f"剩余 {human_bytes(int(local_usage.get('free_bytes') or 0))}"
+                f"总计 {human_bytes(int(local_usage.get('total_bytes') or 0))}"
             )
 
         self.metric_vars["drive"].set(drive_metric)
