@@ -16,6 +16,8 @@ if ($LASTEXITCODE -ne 0) {
     --onefile `
     --windowed `
     --name 'SMSIArchiveClient' `
+    --icon (Join-Path $ProjectRoot 'assets\smsi_archive.ico') `
+    --add-data ((Join-Path $ProjectRoot 'assets') + ';assets') `
     --collect-all keyring `
     --collect-all pyarrow `
     --collect-all tzdata `
