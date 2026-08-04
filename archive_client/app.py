@@ -630,7 +630,7 @@ class ArchiveClientApp(tk.Tk):
         super().__init__()
         self.withdraw()
         self.title("SMSI 归档客户端")
-        self.geometry("1080x700")
+        self.geometry("1000x650")
         self.minsize(920, 600)
         self.configure(bg=BG)
         self.config_store = ConfigStore()
@@ -1042,7 +1042,7 @@ class ArchiveClientApp(tk.Tk):
             padx=16,
             pady=8,
         )
-        metrics.grid(row=0, column=0, sticky="ew", pady=(12, 0))
+        metrics.grid(row=0, column=0, sticky="ew")
         self.metric_vars = {
             "drive": tk.StringVar(value="--"),
             "drive_detail": tk.StringVar(value="正在读取账号容量"),
