@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import queue
 import subprocess
 import threading
@@ -17,6 +18,7 @@ from .models import (
     BatchDownloadResult,
     DownloadProgress,
     DownloadResult,
+    OperationCancelled,
 )
 from .remotes import DriveRemote, R2Remote, resolve_rclone_binary
 from .scheduler import install_task, remove_task, task_installed
@@ -31,6 +33,7 @@ GREEN = "#13795b"
 AMBER = "#9a6700"
 RED = "#b42318"
 BLUE = "#1d4ed8"
+LOGGER = logging.getLogger(__name__)
 
 
 def human_bytes(value: int) -> str:
@@ -112,6 +115,7 @@ class SettingsDialog(tk.Toplevel):
                 value=config.require_both_replicas
             ),
             "history_days": tk.IntVar(value=config.history_days),
+            "download_workers": tk.IntVar(value=config.download_workers),
             "access_key": tk.StringVar(),
             "secret_key": tk.StringVar(),
         }
@@ -121,6 +125,7 @@ class SettingsDialog(tk.Toplevel):
         self.r2_credential_text = self._credential_status()
         self.test_events: queue.Queue[tuple[str, bool, str]] = queue.Queue()
         self.test_buttons: dict[str, ttk.Button] = {}
+        self.tests_running: set[str] = set()
         self._build()
         self._update_r2_status()
         self._poll_id = self.after(100, self._drain_test_events)
@@ -244,6 +249,15 @@ class SettingsDialog(tk.Toplevel):
         ttk.Spinbox(
             policy, from_=7, to=3650, textvariable=self.vars["history_days"]
         ).grid(row=2, column=1, sticky="w", pady=5)
+        ttk.Label(policy, text="并发下载数").grid(
+            row=3, column=0, sticky="w", padx=(0, 12), pady=5
+        )
+        ttk.Spinbox(
+            policy,
+            from_=1,
+            to=8,
+            textvariable=self.vars["download_workers"],
+        ).grid(row=3, column=1, sticky="w", pady=5)
 
     def _choose_root(self) -> None:
         selected = filedialog.askdirectory(
@@ -282,6 +296,11 @@ class SettingsDialog(tk.Toplevel):
             if for_save
             else self.config.history_days
         )
+        download_workers = (
+            int(self.vars["download_workers"].get())
+            if for_save
+            else self.config.download_workers
+        )
         return AppConfig(
             profile_id=str(self.vars["profile_id"].get()).strip(),
             display_name=str(self.vars["display_name"].get()).strip(),
@@ -298,6 +317,7 @@ class SettingsDialog(tk.Toplevel):
             preferred_replica=str(self.vars["preferred_replica"].get()).strip(),
             require_both_replicas=bool(self.vars["require_both_replicas"].get()),
             history_days=history_days,
+            download_workers=download_workers,
         )
 
     def _test_connection(self, replica: str) -> None:
@@ -328,6 +348,7 @@ class SettingsDialog(tk.Toplevel):
 
         button = self.test_buttons[replica]
         button.configure(state="disabled")
+        self.tests_running.add(replica)
 
         def run() -> None:
             try:
@@ -350,12 +371,20 @@ class SettingsDialog(tk.Toplevel):
                 else:
                     self.r2_connection_text = f"{prefix}：{message}"
                     self._update_r2_status()
+                self.tests_running.discard(replica)
                 self.test_buttons[replica].configure(state="normal")
         except queue.Empty:
             pass
         self._poll_id = self.after(100, self._drain_test_events)
 
     def _close(self) -> None:
+        if self.tests_running:
+            messagebox.showinfo(
+                "连接测试尚未完成",
+                "请等待当前连接测试完成后再关闭设置窗口。",
+                parent=self,
+            )
+            return
         try:
             self.after_cancel(self._poll_id)
         except (AttributeError, tk.TclError):
@@ -363,6 +392,13 @@ class SettingsDialog(tk.Toplevel):
         self.destroy()
 
     def _save(self) -> None:
+        if self.tests_running:
+            messagebox.showinfo(
+                "连接测试尚未完成",
+                "请等待当前连接测试完成后再保存设置。",
+                parent=self,
+            )
+            return
         try:
             config = self._form_config(for_save=True)
             errors = config.validate()
@@ -382,6 +418,13 @@ class SettingsDialog(tk.Toplevel):
         self._close()
 
     def _delete_profile(self) -> None:
+        if self.tests_running:
+            messagebox.showinfo(
+                "连接测试尚未完成",
+                "请等待当前连接测试完成后再删除配置。",
+                parent=self,
+            )
+            return
         if not messagebox.askyesno(
             "删除采集服务器配置",
             f"确认删除“{self.config.display_name}”及其本机 R2 凭据？\n"
@@ -420,14 +463,27 @@ class ArchiveClientApp(tk.Tk):
         self._usage_refreshing: set[str] = set()
         self._scan_progress_keys: set[tuple[str, ...]] = set()
         self._scan_progress_total = 0
+        self._operation_kind: str | None = None
+        self._active_cancel: threading.Event | None = None
+        self._active_thread: threading.Thread | None = None
+        self._closing = False
         self._speed_sample_at: float | None = None
         self._speed_sample_bytes = 0
         self._transfer_speed: float | None = None
         self.schedule_installed = task_installed()
         self._configure_styles()
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_events)
         self.after(250, self.refresh)
+
+    def report_callback_exception(self, exc_type, exc_value, traceback) -> None:
+        LOGGER.error(
+            "Unhandled Tk callback error",
+            exc_info=(exc_type, exc_value, traceback),
+        )
+        if not self._closing:
+            messagebox.showerror("界面操作失败", str(exc_value), parent=self)
 
     @property
     def profile_count(self) -> int:
@@ -531,6 +587,13 @@ class ArchiveClientApp(tk.Tk):
             action_bar, text="重新校验", command=self.verify_selected
         )
         self.verify_button.pack(side="left", padx=(8, 0))
+        self.cancel_button = ttk.Button(
+            action_bar,
+            text="取消当前任务",
+            command=self.cancel_current_operation,
+            state="disabled",
+        )
+        self.cancel_button.pack(side="left", padx=(8, 0))
         self.reports_button = ttk.Button(
             action_bar, text="打开报告", command=self.open_reports
         )
@@ -644,6 +707,7 @@ class ArchiveClientApp(tk.Tk):
             if update.object_count:
                 detail = (
                     f"来源 {source} · {update.object_count} 个对象 · "
+                    f"{update.download_workers} 并发 · "
                     f"共 {human_bytes(update.bytes_total)}"
                 )
             else:
@@ -658,7 +722,7 @@ class ArchiveClientApp(tk.Tk):
                 f"{title_prefix}{update.archive_date} · 正在切换到 {source}"
             )
             self.progress_detail_var.set(
-                f"对象 {update.object_index}/{update.object_count} · "
+                f"已完成 {update.completed_objects}/{update.object_count} · "
                 f"{compact_name(update.object_name or '')}"
             )
             return
@@ -684,7 +748,8 @@ class ArchiveClientApp(tk.Tk):
                     self._speed_sample_bytes = network_bytes
 
             parts = [
-                f"对象 {update.object_index}/{update.object_count}",
+                f"已完成 {update.completed_objects}/{update.object_count}",
+                f"并发 {update.active_transfers}",
                 compact_name(update.object_name or ""),
                 f"{human_bytes(update.bytes_completed)} / {human_bytes(update.bytes_total)}",
             ]
@@ -742,11 +807,73 @@ class ArchiveClientApp(tk.Tk):
             self.add_profile_button,
         ):
             button.configure(state=state)
+        self.cancel_button.configure(
+            state="normal"
+            if value
+            and self._active_cancel is not None
+            and not self._active_cancel.is_set()
+            else "disabled"
+        )
         self.profile_combo.configure(state="disabled" if value else "readonly")
         if status:
             self.status_var.set(status)
         if not value:
             self.progress.configure(value=0)
+            self._operation_kind = None
+            self._active_cancel = None
+            self._active_thread = None
+
+    def _begin_operation(self, kind: str, *, cancelable: bool) -> threading.Event | None:
+        self._operation_kind = kind
+        self._active_cancel = threading.Event() if cancelable else None
+        return self._active_cancel
+
+    def cancel_current_operation(self) -> None:
+        cancel = self._active_cancel
+        if cancel is None or cancel.is_set():
+            return
+        if not messagebox.askyesno(
+            "取消当前任务",
+            "确认停止当前下载或校验？\n"
+            "下载断点会保留，未完成校验报告不会发布。",
+            parent=self,
+        ):
+            return
+        cancel.set()
+        self.cancel_button.configure(state="disabled")
+        self.status_var.set("正在安全停止当前任务")
+        self.progress_detail_var.set("正在关闭网络连接并保留断点数据")
+
+    def _on_close(self) -> None:
+        if self._closing:
+            return
+        thread = self._active_thread
+        if not self.busy or thread is None or not thread.is_alive():
+            self.destroy()
+            return
+        if not messagebox.askyesno(
+            "关闭客户端",
+            "当前任务尚未完成。确认安全停止并关闭客户端？",
+            parent=self,
+        ):
+            return
+        self._closing = True
+        if self._active_cancel is not None:
+            self._active_cancel.set()
+            self.status_var.set("正在安全停止并关闭客户端")
+            self.progress_detail_var.set("正在终止传输并保留 .partial 断点数据")
+        else:
+            self.status_var.set("正在等待当前只读请求结束后关闭")
+            self.progress_detail_var.set("不会强制中断正在运行的 rclone 请求")
+        self.cancel_button.configure(state="disabled")
+        self.after(100, self._wait_for_safe_close)
+
+    def _wait_for_safe_close(self) -> None:
+        thread = self._active_thread
+        if thread is None or not thread.is_alive():
+            self.destroy()
+            return
+        self.after(100, self._wait_for_safe_close)
 
     def _schedule_summary(self) -> str:
         if not self.schedule_installed:
@@ -758,16 +885,22 @@ class ArchiveClientApp(tk.Tk):
         def run() -> None:
             try:
                 result = task()
+            except OperationCancelled as exc:
+                self.events.put(("operation_cancelled", str(exc)))
             except Exception as exc:
+                LOGGER.exception("Background operation failed")
                 self.events.put(("error", exc))
             else:
                 self.events.put((success_event, result))
 
-        threading.Thread(target=run, daemon=True).start()
+        thread = threading.Thread(target=run, daemon=True)
+        self._active_thread = thread
+        thread.start()
 
     def refresh(self, *, force: bool = False) -> None:
         if self.busy:
             return
+        self._begin_operation("scan", cancelable=False)
         self._usage_refreshing = {"google_drive", "r2", "local"}
         self._scan_progress_keys.clear()
         self._scan_progress_total = 0
@@ -791,11 +924,14 @@ class ArchiveClientApp(tk.Tk):
                     update=report,
                 )
             except Exception as exc:
+                LOGGER.exception("Dashboard scan failed")
                 self.events.put(("scan_error", exc))
             else:
                 self.events.put(("scan_complete", result))
 
-        threading.Thread(target=run, daemon=True).start()
+        thread = threading.Thread(target=run, daemon=True)
+        self._active_thread = thread
+        thread.start()
 
     def _selected_dates(self) -> tuple[str, ...]:
         selected = set(self.table.selection())
@@ -814,6 +950,8 @@ class ArchiveClientApp(tk.Tk):
     def _download_dates(self, archive_dates: tuple[str, ...]) -> None:
         if self.busy:
             return
+        cancel = self._begin_operation("download", cancelable=True)
+        assert cancel is not None
         batch_total = len(archive_dates)
         self._set_busy(
             True,
@@ -830,6 +968,10 @@ class ArchiveClientApp(tk.Tk):
         def run_batch() -> BatchDownloadResult:
             batch = BatchDownloadResult(requested_dates=list(archive_dates))
             for batch_index, archive_date in enumerate(archive_dates, start=1):
+                if cancel.is_set():
+                    raise OperationCancelled(
+                        "操作已取消，未完成文件保留在 .partial 目录"
+                    )
                 self.events.put(
                     (
                         "download_date_start",
@@ -845,7 +987,10 @@ class ArchiveClientApp(tk.Tk):
                                 (update, index, batch_total),
                             )
                         ),
+                        cancel=cancel,
                     )
+                except OperationCancelled:
+                    raise
                 except Exception as exc:
                     batch.failures[archive_date] = str(exc)
                     self.events.put(
@@ -889,6 +1034,8 @@ class ArchiveClientApp(tk.Tk):
         archive_date = archive_dates[0]
         if self.busy:
             return
+        cancel = self._begin_operation("verify", cancelable=True)
+        assert cancel is not None
         self._set_busy(True, f"正在校验 {archive_date}")
         self._reset_transfer_metrics()
         self.progress_detail_var.set("正在读取并校验本地归档")
@@ -896,7 +1043,7 @@ class ArchiveClientApp(tk.Tk):
         self.progress.configure(mode="determinate", value=0, maximum=100)
         self._worker(
             lambda: self.manager.verify_existing_day(
-                archive_date, self._progress_callback
+                archive_date, self._progress_callback, cancel
             ),
             "verify",
         )
@@ -983,6 +1130,7 @@ class ArchiveClientApp(tk.Tk):
             preferred_replica=current.preferred_replica,
             require_both_replicas=current.require_both_replicas,
             history_days=current.history_days,
+            download_workers=current.download_workers,
         )
         identity_errors = config.validate_identity()
         if identity_errors:
@@ -1337,6 +1485,12 @@ class ArchiveClientApp(tk.Tk):
         try:
             while True:
                 event, payload = self.events.get_nowait()
+                if (
+                    self._active_cancel is not None
+                    and self._active_cancel.is_set()
+                    and event in {"progress", "download_progress"}
+                ):
+                    continue
                 if event == "progress":
                     name, current, total = payload
                     percent = (current / total * 100) if total else 0
@@ -1381,8 +1535,14 @@ class ArchiveClientApp(tk.Tk):
                     update_event, update_payload = payload
                     self._handle_scan_update(update_event, update_payload)
                 elif event == "scan_complete":
+                    if self._closing:
+                        self.destroy()
+                        return
                     self._handle_scan_complete(payload)
                 elif event == "scan_error":
+                    if self._closing:
+                        self.destroy()
+                        return
                     self._usage_refreshing.clear()
                     self._scan_progress_keys.clear()
                     self._render_metrics()
@@ -1393,6 +1553,9 @@ class ArchiveClientApp(tk.Tk):
                         "清单读取失败", str(payload), parent=self
                     )
                 elif event == "download_batch":
+                    if self._closing:
+                        self.destroy()
+                        return
                     batch: BatchDownloadResult = payload
                     requested_count = len(batch.requested_dates)
                     downloaded = sum(
@@ -1466,13 +1629,41 @@ class ArchiveClientApp(tk.Tk):
                             )
                     self.refresh()
                 elif event == "verify":
+                    if self._closing:
+                        self.destroy()
+                        return
                     self._set_busy(False, f"{payload['archive_date']} 校验通过")
                     self.refresh()
+                elif event == "operation_cancelled":
+                    if self._closing:
+                        self.destroy()
+                        return
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate")
+                    self._set_busy(False, "当前任务已安全停止")
+                    self.progress_detail_var.set(str(payload))
                 elif event == "error":
+                    if self._closing:
+                        self.destroy()
+                        return
                     self.progress.stop()
                     self.progress.configure(mode="determinate")
                     self._set_busy(False, "操作失败")
                     messagebox.showerror("操作失败", str(payload), parent=self)
         except queue.Empty:
             pass
+        except Exception as exc:
+            LOGGER.exception("UI event handling failed")
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            thread = self._active_thread
+            if thread is not None and thread.is_alive():
+                if self._active_cancel is not None:
+                    self._active_cancel.set()
+                    self.cancel_button.configure(state="disabled")
+                self.status_var.set("界面事件处理失败，正在安全停止后台任务")
+            else:
+                self._set_busy(False, "界面事件处理失败")
+            if not self._closing:
+                messagebox.showerror("界面处理失败", str(exc), parent=self)
         self.after(100, self._drain_events)

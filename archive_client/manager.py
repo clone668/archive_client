@@ -1,25 +1,30 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
-from .config import AppConfig
+from .config import AppConfig, app_data_dir
 from .credentials import CredentialStore
 from .models import (
     ArchiveDayStatus,
+    CancellationToken,
     DownloadProgress,
     DownloadProgressCallback,
     DownloadResult,
     ManifestSnapshot,
+    OperationCancelled,
     ProgressCallback,
     ReplicaDayStatus,
+    raise_if_cancelled,
 )
 from .remotes import (
     ArchiveRemote,
@@ -35,8 +40,17 @@ from .verifier import PureArchivePath, canonical_value, verify_local_day
 REPLICA_LABELS = {
     "google_drive": "Google Drive",
     "r2": "Cloudflare R2",
+    "mixed": "Google Drive / R2",
 }
 DASHBOARD_MANIFEST_CACHE_SECONDS = 300
+
+
+class _CombinedCancellation:
+    def __init__(self, *tokens: CancellationToken | None) -> None:
+        self.tokens = tuple(token for token in tokens if token is not None)
+
+    def is_set(self) -> bool:
+        return any(token.is_set() for token in self.tokens)
 
 
 def replica_label(value: str) -> str:
@@ -99,6 +113,53 @@ class ArchiveManager:
             tuple[str, str], tuple[float, ReplicaDayStatus]
         ] = {}
         self._dashboard_cache_lock = threading.Lock()
+
+    @contextmanager
+    def _local_operation_lock(self, operation: str):
+        identity_errors = self.config.validate_identity()
+        if identity_errors:
+            raise RuntimeError("配置身份无效：" + "；".join(identity_errors))
+        lock_dir = app_data_dir() / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        root_key = hashlib.sha256(
+            str(self.config.archive_root).casefold().encode("utf-8")
+        ).hexdigest()[:24]
+        lock_path = lock_dir / f"archive-root-{root_key}.lock"
+        handle = lock_path.open("a+b")
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise RuntimeError(
+                f"本地归档目录已有下载、校验或清理任务运行中，"
+                f"本次{operation}未启动"
+            ) from exc
+        try:
+            yield
+        finally:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
 
     @property
     def collector_root(self) -> Path:
@@ -538,6 +599,17 @@ class ArchiveManager:
         retention_path: Path,
         progress: ProgressCallback | None = None,
     ) -> dict[str, Any]:
+        with self._local_operation_lock("清理准备"):
+            return self._prepare_manual_cleanup(
+                archive_date, retention_path, progress
+            )
+
+    def _prepare_manual_cleanup(
+        self,
+        archive_date: str,
+        retention_path: Path,
+        progress: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
         archive_date = validate_archive_date(archive_date)
         if self._completed_cleanup_receipt(archive_date):
             raise RuntimeError("该日期已经有完整的云端清理回执")
@@ -623,6 +695,21 @@ class ArchiveManager:
         return plan
 
     def confirm_manual_cleanup(
+        self,
+        archive_date: str,
+        plan_path: Path,
+        operator_confirmation: str,
+        progress: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
+        with self._local_operation_lock("清理确认"):
+            return self._confirm_manual_cleanup(
+                archive_date,
+                plan_path,
+                operator_confirmation,
+                progress,
+            )
+
+    def _confirm_manual_cleanup(
         self,
         archive_date: str,
         plan_path: Path,
@@ -765,11 +852,18 @@ class ArchiveManager:
         archive_date = validate_archive_date(archive_date)
         snapshots: dict[str, ManifestSnapshot] = {}
         errors: list[str] = []
-        for name, remote in (("google_drive", self.drive), ("r2", self.r2)):
-            try:
-                snapshots[name] = remote.fetch_manifest(archive_date)
-            except Exception as exc:
-                errors.append(f"{name}: {exc}")
+        remotes = (("google_drive", self.drive), ("r2", self.r2))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                executor.submit(remote.fetch_manifest, archive_date): name
+                for name, remote in remotes
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    snapshots[name] = future.result()
+                except Exception as exc:
+                    errors.append(f"{name}: {exc}")
         if self.config.require_both_replicas:
             if len(snapshots) != 2:
                 raise RuntimeError("双副本门禁未通过：" + "；".join(errors))
@@ -786,9 +880,30 @@ class ArchiveManager:
         archive_date: str,
         progress: ProgressCallback | None = None,
         detail_progress: DownloadProgressCallback | None = None,
+        cancel: CancellationToken | None = None,
+    ) -> DownloadResult:
+        with self._local_operation_lock("下载"):
+            return self._download_day(
+                archive_date,
+                progress,
+                detail_progress,
+                cancel,
+            )
+
+    def _download_day(
+        self,
+        archive_date: str,
+        progress: ProgressCallback | None = None,
+        detail_progress: DownloadProgressCallback | None = None,
+        cancel: CancellationToken | None = None,
     ) -> DownloadResult:
         archive_date = validate_archive_date(archive_date)
+        policy_errors = self.config.validate_policy()
+        if policy_errors:
+            raise RuntimeError("同步策略无效：" + "；".join(policy_errors))
+        raise_if_cancelled(cancel)
         snapshots, warnings = self._load_snapshots(archive_date)
+        raise_if_cancelled(cancel)
         selected = self.config.preferred_replica
         if selected not in snapshots:
             selected = next(iter(snapshots))
@@ -804,20 +919,21 @@ class ArchiveManager:
                 compatible_sources.append(name)
         if len(snapshots) > 1 and len(compatible_sources) == 1:
             warnings.append("另一云端副本 manifest 不一致，不能作为下载回退来源")
-        active_source = selected
-        sources_attempted: list[str] = []
-        sources_completed: list[str] = []
+        download_workers = max(
+            1, min(int(self.config.download_workers), max(object_count, 1))
+        )
         if progress:
-            progress(f"下载来源：{replica_label(active_source)}", 0, 10_000)
+            progress(f"下载来源：{replica_label(selected)}", 0, 10_000)
         if detail_progress:
             detail_progress(
                 DownloadProgress(
                     archive_date=archive_date,
                     stage="preparing",
                     overall_current=0,
-                    source=active_source,
+                    source=selected,
                     object_count=object_count,
                     bytes_total=download_total,
+                    download_workers=download_workers,
                 )
             )
 
@@ -829,6 +945,9 @@ class ArchiveManager:
                     (final / ".smsi-verified.json").read_text(encoding="utf-8")
                 )
                 if marker.get("manifest_sha256") == snapshot.sha256:
+                    report_path = self.report_path(archive_date)
+                    if not report_path.is_file():
+                        write_json_atomic(report_path, marker)
                     if progress:
                         progress("本地归档已完整验证", 10_000, 10_000)
                     if detail_progress:
@@ -844,6 +963,8 @@ class ArchiveManager:
                                 bytes_total=download_total,
                                 stage_current=object_count,
                                 stage_total=object_count,
+                                completed_objects=object_count,
+                                download_workers=download_workers,
                             )
                         )
                     return DownloadResult(
@@ -851,7 +972,7 @@ class ArchiveManager:
                         archive_date,
                         selected,
                         final,
-                        self.report_path(archive_date),
+                        report_path,
                         snapshot.object_count,
                         snapshot.row_count,
                         0,
@@ -861,24 +982,124 @@ class ArchiveManager:
 
         staging = self.staging_root(archive_date)
         staging.mkdir(parents=True, exist_ok=True)
-        downloaded = 0
-        completed_bytes = 0
+        additional_bytes = 0
+        for item in objects:
+            relative_key = str(item["relative_key"])
+            inside = PureArchivePath.strip_date(relative_key, archive_date)
+            destination = staging / Path(*inside.parts)
+            temporary = destination.with_suffix(destination.suffix + ".partial")
+            existing_bytes = sum(
+                path.stat().st_size for path in (destination, temporary) if path.is_file()
+            )
+            additional_bytes += max(
+                int(item["size_bytes"]) - existing_bytes,
+                0,
+            )
+        free_bytes = shutil.disk_usage(staging).free
+        reserve_bytes = 256 * 1024 * 1024 if additional_bytes else 0
+        if free_bytes < additional_bytes + reserve_bytes:
+            raise RuntimeError(
+                "本地磁盘空间不足："
+                f"还需约 {additional_bytes / (1024 ** 3):.2f} GiB，"
+                f"当前可用 {free_bytes / (1024 ** 3):.2f} GiB，"
+                "并要求保留 0.25 GiB 安全空间"
+            )
+        abort = threading.Event()
+        transfer_cancel = _CombinedCancellation(cancel, abort)
+        progress_lock = threading.Lock()
+        publish_lock = threading.Lock()
+        object_progress_bytes: dict[int, int] = {}
+        object_network_bytes: dict[int, int] = {}
+        active_objects: set[int] = set()
+        completed_objects: set[int] = set()
         last_overall = 0
-        for object_index, item in enumerate(objects, start=1):
+
+        def publish_download_progress(
+            *,
+            stage: str,
+            object_index: int,
+            relative_key: str,
+            expected_size: int,
+            object_current: int,
+            network_current: int,
+            source: str,
+            completed: bool = False,
+        ) -> None:
+            nonlocal last_overall
+            with publish_lock:
+                with progress_lock:
+                    object_progress_bytes[object_index] = max(
+                        object_progress_bytes.get(object_index, 0),
+                        min(max(int(object_current), 0), expected_size),
+                    )
+                    object_network_bytes[object_index] = max(
+                        object_network_bytes.get(object_index, 0),
+                        max(int(network_current), 0),
+                    )
+                    if completed:
+                        completed_objects.add(object_index)
+                        active_objects.discard(object_index)
+                        object_progress_bytes[object_index] = expected_size
+                    bytes_completed = min(
+                        sum(object_progress_bytes.values()), download_total
+                    )
+                    network_completed = sum(object_network_bytes.values())
+                    fraction = (
+                        bytes_completed / download_total if download_total else 1.0
+                    )
+                    last_overall = max(last_overall, int(fraction * 7_000))
+                    update = DownloadProgress(
+                        archive_date=archive_date,
+                        stage=stage,
+                        overall_current=last_overall,
+                        source=source,
+                        object_name=PurePosixPath(relative_key).name,
+                        object_index=object_index,
+                        object_count=object_count,
+                        object_bytes_completed=object_progress_bytes[object_index],
+                        object_bytes_total=expected_size,
+                        bytes_completed=bytes_completed,
+                        bytes_total=download_total,
+                        network_bytes_completed=network_completed,
+                        stage_current=len(completed_objects),
+                        stage_total=object_count,
+                        completed_objects=len(completed_objects),
+                        active_transfers=len(active_objects),
+                        download_workers=download_workers,
+                    )
+                if progress:
+                    progress(
+                        f"下载 · {replica_label(source)} · "
+                        f"{PurePosixPath(relative_key).name}",
+                        update.overall_current,
+                        10_000,
+                    )
+                if detail_progress:
+                    detail_progress(update)
+
+        def download_one(
+            object_index: int, item: dict[str, Any]
+        ) -> dict[str, Any]:
+            raise_if_cancelled(transfer_cancel)
             relative_key = str(item["relative_key"])
             inside = PureArchivePath.strip_date(relative_key, archive_date)
             destination = staging / Path(*inside.parts)
             expected_size = int(item["size_bytes"])
             expected_sha256 = str(item["sha256"])
             object_high_water = 0
-            completed = False
-            attempt_order = [active_source] + [
-                name for name in compatible_sources if name != active_source
+            network_before_attempt = 0
+            last_published_at = 0.0
+            attempt_order = [selected] + [
+                name for name in compatible_sources if name != selected
             ]
+            attempted: list[str] = []
+            object_warnings: list[str] = []
+            with progress_lock:
+                active_objects.add(object_index)
             for source_name in attempt_order:
+                raise_if_cancelled(transfer_cancel)
                 remote = self.drive if source_name == "google_drive" else self.r2
-                if source_name not in sources_attempted:
-                    sources_attempted.append(source_name)
+                attempted.append(source_name)
                 attempt_start: int | None = None
                 attempt_high_water = 0
 
@@ -889,7 +1110,8 @@ class ArchiveManager:
                     *,
                     source: str = source_name,
                 ) -> None:
-                    nonlocal attempt_high_water, attempt_start, object_high_water, last_overall
+                    nonlocal attempt_high_water, attempt_start, object_high_water
+                    nonlocal last_published_at
                     normalized_current = min(max(int(current), 0), expected_size)
                     if attempt_start is None:
                         attempt_start = normalized_current
@@ -898,41 +1120,22 @@ class ArchiveManager:
                         max(normalized_current - attempt_start, 0),
                     )
                     object_high_water = max(object_high_water, normalized_current)
-                    if download_total:
-                        fraction = (
-                            completed_bytes + object_high_water
-                        ) / download_total
-                    else:
-                        fraction = 1.0
-                    last_overall = max(last_overall, int(fraction * 7_000))
-                    if progress:
-                        progress(
-                            f"下载 · {replica_label(source)} · {PurePosixPath(name).name}",
-                            last_overall,
-                            10_000,
-                        )
-                    if detail_progress:
-                        detail_progress(
-                            DownloadProgress(
-                                archive_date=archive_date,
-                                stage="downloading",
-                                overall_current=last_overall,
-                                source=source,
-                                object_name=PurePosixPath(name).name,
-                                object_index=object_index,
-                                object_count=object_count,
-                                object_bytes_completed=normalized_current,
-                                object_bytes_total=expected_size,
-                                bytes_completed=min(
-                                    completed_bytes + object_high_water,
-                                    download_total,
-                                ),
-                                bytes_total=download_total,
-                                network_bytes_completed=downloaded + attempt_high_water,
-                                stage_current=object_index,
-                                stage_total=object_count,
-                            )
-                        )
+                    now = time.monotonic()
+                    if (
+                        normalized_current < expected_size
+                        and now - last_published_at < 0.2
+                    ):
+                        return
+                    last_published_at = now
+                    publish_download_progress(
+                        stage="downloading",
+                        object_index=object_index,
+                        relative_key=name,
+                        expected_size=expected_size,
+                        object_current=object_high_water,
+                        network_current=network_before_attempt + attempt_high_water,
+                        source=source,
+                    )
 
                 try:
                     transferred = remote.download_object(
@@ -941,87 +1144,111 @@ class ArchiveManager:
                         expected_size,
                         expected_sha256,
                         object_progress,
+                        transfer_cancel,
                     )
-                    downloaded += transferred
+                except OperationCancelled:
+                    raise
                 except Exception as exc:
                     if source_name == attempt_order[-1]:
                         raise RuntimeError(
+                            f"{PurePosixPath(relative_key).name} · "
                             f"{replica_label(source_name)} 下载失败：{exc}"
                         ) from exc
+                    network_before_attempt += attempt_high_water
                     fallback = attempt_order[attempt_order.index(source_name) + 1]
                     warning = (
+                        f"{PurePosixPath(relative_key).name}："
                         f"{replica_label(source_name)} 下载失败，已切换到 "
                         f"{replica_label(fallback)}：{exc}"
                     )
-                    warnings.append(warning)
-                    if progress:
-                        progress(
-                            f"来源切换：{replica_label(fallback)}",
-                            last_overall,
-                            10_000,
-                        )
-                    if detail_progress:
-                        detail_progress(
-                            DownloadProgress(
-                                archive_date=archive_date,
-                                stage="switching",
-                                overall_current=last_overall,
-                                source=fallback,
-                                object_name=PurePosixPath(relative_key).name,
-                                object_index=object_index,
-                                object_count=object_count,
-                                object_bytes_completed=object_high_water,
-                                object_bytes_total=expected_size,
-                                bytes_completed=min(
-                                    completed_bytes + object_high_water,
-                                    download_total,
-                                ),
-                                bytes_total=download_total,
-                                network_bytes_completed=downloaded,
-                                stage_current=object_index,
-                                stage_total=object_count,
-                            )
-                        )
-                    continue
-                active_source = source_name
-                if source_name not in sources_completed:
-                    sources_completed.append(source_name)
-                completed = True
-                break
-            if not completed:
-                raise RuntimeError(f"归档对象下载失败：{relative_key}")
-            completed_bytes += expected_size
-            last_overall = max(
-                last_overall,
-                int((completed_bytes / download_total) * 7_000)
-                if download_total
-                else 7_000,
-            )
-            if progress:
-                progress(
-                    f"下载 · {replica_label(active_source)} · {PurePosixPath(relative_key).name}",
-                    last_overall,
-                    10_000,
-                )
-            if detail_progress:
-                detail_progress(
-                    DownloadProgress(
-                        archive_date=archive_date,
-                        stage="downloading",
-                        overall_current=last_overall,
-                        source=active_source,
-                        object_name=PurePosixPath(relative_key).name,
+                    object_warnings.append(warning)
+                    temporary = destination.with_suffix(destination.suffix + ".partial")
+                    temporary.unlink(missing_ok=True)
+                    publish_download_progress(
+                        stage="switching",
                         object_index=object_index,
-                        object_count=object_count,
-                        object_bytes_completed=expected_size,
-                        object_bytes_total=expected_size,
-                        bytes_completed=completed_bytes,
-                        bytes_total=download_total,
-                        network_bytes_completed=downloaded,
-                        stage_current=object_index,
-                        stage_total=object_count,
+                        relative_key=relative_key,
+                        expected_size=expected_size,
+                        object_current=object_high_water,
+                        network_current=network_before_attempt,
+                        source=fallback,
                     )
+                    continue
+                network_total = network_before_attempt + max(
+                    int(transferred), attempt_high_water
                 )
+                publish_download_progress(
+                    stage="downloading",
+                    object_index=object_index,
+                    relative_key=relative_key,
+                    expected_size=expected_size,
+                    object_current=expected_size,
+                    network_current=network_total,
+                    source=source_name,
+                    completed=True,
+                )
+                return {
+                    "index": object_index,
+                    "source": source_name,
+                    "attempted": attempted,
+                    "warnings": object_warnings,
+                    "network_bytes": network_total,
+                }
+            raise RuntimeError(f"归档对象下载失败：{relative_key}")
+
+        results: dict[int, dict[str, Any]] = {}
+        first_error: Exception | None = None
+        if objects:
+            with ThreadPoolExecutor(max_workers=download_workers) as executor:
+                futures = {
+                    executor.submit(download_one, index, item): index
+                    for index, item in enumerate(objects, start=1)
+                }
+                for future in as_completed(futures):
+                    if future.cancelled():
+                        continue
+                    try:
+                        result = future.result()
+                    except OperationCancelled as exc:
+                        abort.set()
+                        if cancel is not None and cancel.is_set():
+                            first_error = first_error or exc
+                    except Exception as exc:
+                        if first_error is None:
+                            first_error = exc
+                        abort.set()
+                    else:
+                        results[result["index"]] = result
+                    if abort.is_set():
+                        for pending in futures:
+                            pending.cancel()
+        if cancel is not None and cancel.is_set():
+            raise OperationCancelled(
+                "操作已取消，未完成文件保留在 .partial 目录"
+            )
+        if first_error is not None:
+            raise first_error
+        if len(results) != object_count:
+            raise RuntimeError("下载任务未完成全部归档对象")
+
+        ordered_results = [results[index] for index in sorted(results)]
+        for result in ordered_results:
+            warnings.extend(result["warnings"])
+        sources_attempted = list(
+            dict.fromkeys(
+                source
+                for result in ordered_results
+                for source in result["attempted"]
+            )
+        )
+        sources_completed = list(
+            dict.fromkeys(result["source"] for result in ordered_results)
+        )
+        active_source = (
+            sources_completed[0] if len(sources_completed) == 1 else "mixed"
+        )
+        downloaded = sum(int(result["network_bytes"]) for result in ordered_results)
+        raise_if_cancelled(cancel)
 
         (staging / "manifest.json").write_bytes(snapshot.raw)
         if progress:
@@ -1038,6 +1265,8 @@ class ArchiveManager:
                     bytes_total=download_total,
                     network_bytes_completed=downloaded,
                     stage_total=object_count,
+                    completed_objects=object_count,
+                    download_workers=download_workers,
                 )
             )
 
@@ -1065,10 +1294,15 @@ class ArchiveManager:
                         network_bytes_completed=downloaded,
                         stage_current=current,
                         stage_total=total,
+                        completed_objects=object_count,
+                        download_workers=download_workers,
                     )
                 )
 
-        report = verify_local_day(staging, snapshot, verification_progress)
+        report = verify_local_day(
+            staging, snapshot, verification_progress, cancel
+        )
+        raise_if_cancelled(cancel)
         report.update(
             {
                 "download_replica": active_source,
@@ -1088,10 +1322,13 @@ class ArchiveManager:
             }
         )
         report_path = self.report_path(archive_date)
-        write_json_atomic(report_path, report)
         write_json_atomic(staging / ".smsi-verified.json", report)
+        raise_if_cancelled(cancel)
         final.parent.mkdir(parents=True, exist_ok=True)
         os.replace(staging, final)
+        # The verified directory is the source of truth. Publish the report only
+        # after that atomic commit, so cancellation cannot leave a false report.
+        write_json_atomic(report_path, report)
         partial_parent = staging.parent
         if partial_parent.exists() and not any(partial_parent.iterdir()):
             partial_parent.rmdir()
@@ -1109,6 +1346,8 @@ class ArchiveManager:
                     network_bytes_completed=downloaded,
                     stage_current=object_count,
                     stage_total=object_count,
+                    completed_objects=object_count,
+                    download_workers=download_workers,
                 )
             )
         return DownloadResult(
@@ -1124,16 +1363,30 @@ class ArchiveManager:
         )
 
     def verify_existing_day(
-        self, archive_date: str, progress: ProgressCallback | None = None
+        self,
+        archive_date: str,
+        progress: ProgressCallback | None = None,
+        cancel: CancellationToken | None = None,
+    ) -> dict[str, Any]:
+        with self._local_operation_lock("校验"):
+            return self._verify_existing_day(archive_date, progress, cancel)
+
+    def _verify_existing_day(
+        self,
+        archive_date: str,
+        progress: ProgressCallback | None = None,
+        cancel: CancellationToken | None = None,
     ) -> dict[str, Any]:
         archive_date = validate_archive_date(archive_date)
+        raise_if_cancelled(cancel)
         root = self.final_root(archive_date)
         if not root.is_dir():
             raise RuntimeError("本地日期目录不存在")
         cleanup_receipt = self._completed_cleanup_receipt(archive_date)
         if cleanup_receipt:
             snapshot = self._local_snapshot(archive_date)
-            report = verify_local_day(root, snapshot, progress)
+            report = verify_local_day(root, snapshot, progress, cancel)
+            raise_if_cancelled(cancel)
             report.update(
                 {
                     "replicas_match": None,
@@ -1147,10 +1400,12 @@ class ArchiveManager:
             write_json_atomic(root / ".smsi-verified.json", report)
             return report
         snapshots, _ = self._load_snapshots(archive_date)
+        raise_if_cancelled(cancel)
         snapshot = snapshots.get(self.config.preferred_replica) or next(
             iter(snapshots.values())
         )
-        report = verify_local_day(root, snapshot, progress)
+        report = verify_local_day(root, snapshot, progress, cancel)
+        raise_if_cancelled(cancel)
         report["replicas_match"] = len(snapshots) == 2 and self.replicas_match(
             snapshots["google_drive"], snapshots["r2"]
         )

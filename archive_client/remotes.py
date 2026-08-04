@@ -15,7 +15,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .config import AppConfig
-from .models import ManifestSnapshot, ProgressCallback
+from .models import (
+    CancellationToken,
+    ManifestSnapshot,
+    OperationCancelled,
+    ProgressCallback,
+    raise_if_cancelled,
+)
 
 
 DATE_DIR_RE = re.compile(r"^date=(\d{4}-\d{2}-\d{2})/$")
@@ -57,11 +63,15 @@ def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def sha256_file(path: Path) -> str:
+def sha256_file(
+    path: Path, cancel: CancellationToken | None = None
+) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            raise_if_cancelled(cancel)
             digest.update(chunk)
+    raise_if_cancelled(cancel)
     return digest.hexdigest()
 
 
@@ -150,6 +160,7 @@ class ArchiveRemote(ABC):
         expected_size: int,
         expected_sha256: str,
         progress: ProgressCallback | None = None,
+        cancel: CancellationToken | None = None,
     ) -> int:
         raise NotImplementedError
 
@@ -188,6 +199,7 @@ class UnavailableRemote(ArchiveRemote):
         expected_size: int,
         expected_sha256: str,
         progress: ProgressCallback | None = None,
+        cancel: CancellationToken | None = None,
     ) -> int:
         self._raise()
         return 0
@@ -338,13 +350,15 @@ class DriveRemote(ArchiveRemote):
         expected_size: int,
         expected_sha256: str,
         progress: ProgressCallback | None = None,
+        cancel: CancellationToken | None = None,
     ) -> int:
         relative_key = validate_relative_key(relative_key)
+        raise_if_cancelled(cancel)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
             if (
                 destination.stat().st_size == expected_size
-                and sha256_file(destination) == expected_sha256
+                and sha256_file(destination, cancel) == expected_sha256
             ):
                 return 0
             destination.unlink()
@@ -388,6 +402,16 @@ class DriveRemote(ArchiveRemote):
         deadline = time.monotonic() + timeout
         try:
             while process.poll() is None:
+                if cancel is not None and cancel.is_set():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    raise OperationCancelled(
+                        "操作已取消，未完成文件保留在 .partial 目录"
+                    )
                 if progress and temporary.exists():
                     progress(
                         relative_key,
@@ -406,8 +430,9 @@ class DriveRemote(ArchiveRemote):
             raise RuntimeError(detail or "rclone 执行失败")
         if temporary.stat().st_size != expected_size:
             raise RuntimeError(f"Google Drive 下载大小不一致: {relative_key}")
-        if sha256_file(temporary) != expected_sha256:
+        if sha256_file(temporary, cancel) != expected_sha256:
             raise RuntimeError(f"Google Drive 下载哈希不一致: {relative_key}")
+        raise_if_cancelled(cancel)
         temporary.replace(destination)
         if progress:
             progress(relative_key, expected_size, expected_size)
@@ -560,13 +585,15 @@ class R2Remote(ArchiveRemote):
         expected_size: int,
         expected_sha256: str,
         progress: ProgressCallback | None = None,
+        cancel: CancellationToken | None = None,
     ) -> int:
         relative_key = validate_relative_key(relative_key)
+        raise_if_cancelled(cancel)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
             if (
                 destination.stat().st_size == expected_size
-                and sha256_file(destination) == expected_sha256
+                and sha256_file(destination, cancel) == expected_sha256
             ):
                 return 0
             destination.unlink()
@@ -576,7 +603,8 @@ class R2Remote(ArchiveRemote):
             temporary.unlink()
             offset = 0
         if offset == expected_size:
-            if sha256_file(temporary) == expected_sha256:
+            if sha256_file(temporary, cancel) == expected_sha256:
+                raise_if_cancelled(cancel)
                 temporary.replace(destination)
                 return 0
             temporary.unlink()
@@ -589,12 +617,14 @@ class R2Remote(ArchiveRemote):
             arguments["Range"] = f"bytes={offset}-"
         if progress:
             progress(relative_key, offset, expected_size)
+        raise_if_cancelled(cancel)
         response = self.client.get_object(**arguments)
         body = response["Body"]
         downloaded = 0
         try:
             with temporary.open("ab" if offset else "wb") as handle:
-                for chunk in iter(lambda: body.read(8 * 1024 * 1024), b""):
+                for chunk in iter(lambda: body.read(1024 * 1024), b""):
+                    raise_if_cancelled(cancel)
                     handle.write(chunk)
                     downloaded += len(chunk)
                     if progress:
@@ -605,8 +635,9 @@ class R2Remote(ArchiveRemote):
                 close()
         if temporary.stat().st_size != expected_size:
             raise RuntimeError(f"R2 下载大小不一致: {relative_key}")
-        if sha256_file(temporary) != expected_sha256:
+        if sha256_file(temporary, cancel) != expected_sha256:
             temporary.unlink(missing_ok=True)
             raise RuntimeError(f"R2 下载哈希不一致: {relative_key}")
+        raise_if_cancelled(cancel)
         temporary.replace(destination)
         return downloaded

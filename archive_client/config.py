@@ -46,6 +46,7 @@ class AppConfig:
     preferred_replica: str = "google_drive"
     require_both_replicas: bool = True
     history_days: int = 45
+    download_workers: int = 4
 
     @property
     def drive_root(self) -> str:
@@ -114,8 +115,18 @@ class AppConfig:
         errors: list[str] = []
         if self.preferred_replica not in {"google_drive", "r2"}:
             errors.append("首选副本无效")
-        if not 7 <= int(self.history_days) <= 3650:
+        try:
+            history_days = int(self.history_days)
+        except (TypeError, ValueError):
+            history_days = 0
+        if not 7 <= history_days <= 3650:
             errors.append("显示历史天数必须在 7 到 3650 之间")
+        try:
+            download_workers = int(self.download_workers)
+        except (TypeError, ValueError):
+            download_workers = 0
+        if not 1 <= download_workers <= 8:
+            errors.append("并发下载数必须在 1 到 8 之间")
         return errors
 
     def validate(self) -> list[str]:

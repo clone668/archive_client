@@ -2,10 +2,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 
 ProgressCallback = Callable[[str, int, int], None]
+
+
+class CancellationToken(Protocol):
+    def is_set(self) -> bool: ...
+
+
+class OperationCancelled(RuntimeError):
+    """Raised after an in-flight operation has stopped without publishing output."""
+
+
+def raise_if_cancelled(cancel: CancellationToken | None) -> None:
+    if cancel is not None and cancel.is_set():
+        raise OperationCancelled("操作已取消，未完成结果不会发布")
 
 
 @dataclass(frozen=True)
@@ -25,6 +38,9 @@ class DownloadProgress:
     network_bytes_completed: int = 0
     stage_current: int = 0
     stage_total: int = 0
+    completed_objects: int = 0
+    active_transfers: int = 0
+    download_workers: int = 1
 
 
 DownloadProgressCallback = Callable[[DownloadProgress], None]

@@ -7,7 +7,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping
 
-from .models import ManifestSnapshot, ProgressCallback
+from .models import (
+    CancellationToken,
+    ManifestSnapshot,
+    ProgressCallback,
+    raise_if_cancelled,
+)
 from .remotes import sha256_file, validate_relative_key
 
 
@@ -47,7 +52,12 @@ def update_content_digest(digest: Any, row: Mapping[str, Any]) -> None:
     digest.update(payload)
 
 
-def verify_parquet(path: Path, item: Mapping[str, Any]) -> dict[str, Any]:
+def verify_parquet(
+    path: Path,
+    item: Mapping[str, Any],
+    cancel: CancellationToken | None = None,
+) -> dict[str, Any]:
+    raise_if_cancelled(cancel)
     try:
         import pyarrow.parquet as pq
     except ImportError as exc:
@@ -72,7 +82,10 @@ def verify_parquet(path: Path, item: Mapping[str, Any]) -> dict[str, Any]:
                 raise RuntimeError(f"业务内容摘要缺失: {path}")
             digest = hashlib.sha256()
             for batch in parquet.iter_batches(batch_size=10_000):
-                for row in batch.to_pylist():
+                raise_if_cancelled(cancel)
+                for row_index, row in enumerate(batch.to_pylist()):
+                    if row_index % 256 == 0:
+                        raise_if_cancelled(cancel)
                     update_content_digest(digest, row)
             content_sha256 = digest.hexdigest()
             if content_sha256 != expected_content:
@@ -90,12 +103,14 @@ def verify_local_day(
     root: Path,
     snapshot: ManifestSnapshot,
     progress: ProgressCallback | None = None,
+    cancel: CancellationToken | None = None,
 ) -> dict[str, Any]:
     objects = snapshot.manifest["objects"]
     verified = []
     total_rows = 0
     tree_material = []
     for index, item in enumerate(objects, start=1):
+        raise_if_cancelled(cancel)
         relative_key = validate_relative_key(
             item.get("relative_key"), snapshot.archive_date
         )
@@ -107,9 +122,9 @@ def verify_local_day(
             raise RuntimeError(f"本地归档对象缺失: {relative_key}")
         if path.stat().st_size != expected_size:
             raise RuntimeError(f"本地归档对象大小不一致: {relative_key}")
-        if sha256_file(path) != expected_sha256:
+        if sha256_file(path, cancel) != expected_sha256:
             raise RuntimeError(f"本地归档对象 SHA-256 不一致: {relative_key}")
-        parquet = verify_parquet(path, item)
+        parquet = verify_parquet(path, item, cancel)
         total_rows += parquet["row_count"]
         entry = {
             "relative_key": relative_key,
@@ -130,6 +145,8 @@ def verify_local_day(
         )
         if progress:
             progress(relative_key, index, len(objects))
+
+    raise_if_cancelled(cancel)
 
     if len(verified) != snapshot.object_count:
         raise RuntimeError("本地归档对象总数不一致")

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -10,6 +12,22 @@ from archive_client.config import ConfigStore, app_data_dir
 from archive_client.credentials import CredentialStore
 from archive_client.manager import ArchiveManager
 from archive_client.verifier import canonical_value
+
+
+def configure_logging() -> None:
+    log_dir = app_data_dir() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        log_dir / "client.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[handler],
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,12 +122,28 @@ def run_once(
 
 
 def main() -> int:
+    configure_logging()
     args = parse_args()
     if args.run_once:
         return run_once(args.date, args.profile, args.all_profiles)
     from archive_client.app import ArchiveClientApp
 
-    app = ArchiveClientApp()
+    try:
+        app = ArchiveClientApp()
+    except Exception as exc:
+        logging.getLogger(__name__).exception("GUI startup failed")
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "SMSI 归档客户端启动失败",
+            f"{exc}\n\n详细日志：{app_data_dir() / 'logs' / 'client.log'}",
+            parent=root,
+        )
+        root.destroy()
+        return 1
     app.mainloop()
     return 0
 

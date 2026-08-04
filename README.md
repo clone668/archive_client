@@ -23,14 +23,18 @@ Windows 本地双云端归档管理器。它可以同时管理多台采集服务
 - Google Drive 使用 `rclone` OAuth；R2 使用 S3 兼容 API。
 - R2 密钥保存到 Windows 凭据管理器，不写入 `config.json`。
 - 下载写入 `.partial`，完整校验后原子改名为正式日期目录。
+- 默认并行下载 4 个归档对象，可在“同步策略”中设置为 1–8；下载前并行读取
+  双云端 manifest，并在启动传输前检查本地剩余空间。
 - 支持在日期列表中用 `Ctrl` 或 `Shift` 多选，并按列表顺序逐日期下载；单日失败
   不会阻止其余已选日期，完成后统一显示成功与失败结果。
 - 校验文件大小、SHA-256、Parquet schema、行数和业务内容摘要。
 - 生成逐对象 JSON 验证报告。
-- 显示当前日期、下载来源、对象序号、累计容量、实时速度、预计剩余时间，以及
+- 显示当前日期、下载来源、已完成对象数、活动并发数、累计容量、实时速度、预计剩余时间，以及
   下载和完整恢复校验的总进度；下载中断时仅切换到 manifest 完全一致的另一
   副本，并记录实际来源和警告。
 - 支持 Windows 计划任务，每 30 分钟依次补齐所有启用配置的前一个 UTC 日。
+- 下载和校验支持安全取消；正常关闭客户端会先停止传输并等待后台线程退出。
+  同一本地归档根目录使用跨进程互斥，避免 UI 与计划任务同时写入。
 - 双击已完成日期可打开其本地目录，工具栏可打开归档根目录与报告目录。
 
 ## 首次安装
@@ -105,6 +109,10 @@ D:\SMSI-Archive\
 未完成下载位于 `collector=...\.partial\date=...`，不会显示为已验证。
 不要手工把 `.partial` 改名为正式目录。
 
+R2 会从单个对象的 `.partial` 断点续传；Google Drive 会复用已经完成的对象，
+但会重新下载取消时尚未完成的那个对象。跨云回退只在两个 manifest 完全一致时
+启用，并会重新开始失败对象，避免拼接不同传输来源的临时片段。
+
 ## 无界面执行
 
 下载并校验前一个 UTC 日：
@@ -139,10 +147,11 @@ D:\SMSI-Archive\
 
 R2 Secret 不在上述文件中。
 
-## 测试
+## 源码检查
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m compileall -q archive_client main.py
+.\.venv\Scripts\python.exe -m pip check
 ```
 
 ## 打包
