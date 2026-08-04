@@ -220,13 +220,13 @@ class SettingsPanel(ttk.Frame):
         if not self.is_new and self.parent.profile_count > 1:
             ttk.Button(
                 actions,
-                text="删除此配置",
+                text="× 删除此配置",
                 style="Danger.TButton",
                 command=self._delete_profile,
             ).pack(side="left")
-        ttk.Button(actions, text="返回归档", command=self._close).pack(side="right")
+        ttk.Button(actions, text="← 返回归档", command=self._close).pack(side="right")
         ttk.Button(
-            actions, text="保存设置", style="Primary.TButton", command=self._save
+            actions, text="✓ 保存设置", style="Primary.TButton", command=self._save
         ).pack(side="right", padx=(0, 8))
 
         identity = self._section(general_tab, "归档流")
@@ -238,7 +238,7 @@ class SettingsPanel(ttk.Frame):
         self._field(identity, 1, "配置名称", self.vars["display_name"])
         self._field(identity, 2, "采集流 ID", self.vars["collector_id"])
         self._field(identity, 3, "本地目录", self.vars["local_root"])
-        ttk.Button(identity, text="选择目录", command=self._choose_root).grid(
+        ttk.Button(identity, text="▣ 选择目录", command=self._choose_root).grid(
             row=3, column=2, padx=(8, 0)
         )
         ttk.Checkbutton(
@@ -251,7 +251,7 @@ class SettingsPanel(ttk.Frame):
         self._field(drive, 0, "rclone Remote", self.vars["drive_remote"])
         self._field(drive, 1, "对象前缀", self.vars["drive_prefix"])
         self._field(drive, 2, "rclone 路径", self.vars["rclone_binary"])
-        ttk.Button(drive, text="配置 OAuth", command=self._configure_drive).grid(
+        ttk.Button(drive, text="⚙ 配置 OAuth", command=self._configure_drive).grid(
             row=2, column=2, padx=(8, 0)
         )
         ttk.Label(
@@ -262,7 +262,9 @@ class SettingsPanel(ttk.Frame):
             row=3, column=0, columnspan=2, sticky="w", pady=(5, 0)
         )
         self.test_buttons["google_drive"] = ttk.Button(
-            drive, text="测试连接", command=lambda: self._test_connection("google_drive")
+            drive,
+            text="↗ 测试连接",
+            command=lambda: self._test_connection("google_drive"),
         )
         self.test_buttons["google_drive"].grid(
             row=3, column=2, padx=(8, 0), pady=(5, 0)
@@ -279,7 +281,9 @@ class SettingsPanel(ttk.Frame):
             row=6, column=0, columnspan=2, sticky="w", pady=(5, 0)
         )
         self.test_buttons["r2"] = ttk.Button(
-            r2, text="测试连接", command=lambda: self._test_connection("r2")
+            r2,
+            text="↗ 测试连接",
+            command=lambda: self._test_connection("r2"),
         )
         self.test_buttons["r2"].grid(
             row=6, column=2, padx=(8, 0), pady=(5, 0)
@@ -534,8 +538,8 @@ class ArchiveClientApp(tk.Tk):
         super().__init__()
         self.withdraw()
         self.title("SMSI 归档客户端")
-        self.geometry("1180x780")
-        self.minsize(940, 640)
+        self.geometry("1080x700")
+        self.minsize(920, 600)
         self.configure(bg=BG)
         self.config_store = ConfigStore()
         self.credentials = CredentialStore()
@@ -638,7 +642,7 @@ class ArchiveClientApp(tk.Tk):
             "Metric.TLabel",
             background=SURFACE,
             foreground=INK,
-            font=("Segoe UI Semibold", 9),
+            font=("Segoe UI", 9),
         )
         style.configure(
             "MetricNote.TLabel",
@@ -780,9 +784,29 @@ class ArchiveClientApp(tk.Tk):
             foreground=INK,
             font=("Segoe UI", 9),
         )
+        style.layout("Sync.Toolbutton", style.layout("Toolbutton"))
+        style.configure(
+            "Sync.Toolbutton",
+            background=BG,
+            foreground=INK,
+            font=("Segoe UI", 9),
+            padding=(10, 6),
+            bordercolor=BORDER,
+            relief="flat",
+        )
+        style.map(
+            "Sync.Toolbutton",
+            background=[
+                ("selected", PALE_GREEN),
+                ("active", "#e9eef1"),
+                ("pressed", "#dfe7ea"),
+            ],
+            foreground=[("selected", GREEN), ("disabled", "#9aa6b2")],
+            bordercolor=[("selected", "#bcdcc9"), ("active", BORDER)],
+        )
         style.configure(
             "Treeview",
-            rowheight=31,
+            rowheight=29,
             font=("Segoe UI", 9),
             background=SURFACE,
             fieldbackground=SURFACE,
@@ -791,6 +815,11 @@ class ArchiveClientApp(tk.Tk):
             lightcolor=BORDER,
             darkcolor=BORDER,
         )
+        style.configure(
+            "Treeview.Item",
+            padding=(0, 0, 0, 1),
+            relief="solid",
+        )
         style.map(
             "Treeview",
             background=[("selected", ACCENT)],
@@ -798,7 +827,7 @@ class ArchiveClientApp(tk.Tk):
         )
         style.configure(
             "Treeview.Heading",
-            font=("Segoe UI Semibold", 9),
+            font=("Segoe UI", 9),
             background="#e9eef2",
             foreground=INK,
             padding=(8, 7),
@@ -806,6 +835,19 @@ class ArchiveClientApp(tk.Tk):
             relief="flat",
         )
         style.map("Treeview.Heading", background=[("active", "#dde5ea")])
+        for name, color in (
+            ("Drive", "#4285f4"),
+            ("R2", "#f48120"),
+        ):
+            style.configure(
+                f"{name}.Horizontal.TProgressbar",
+                background=color,
+                troughcolor="#e2e7ea",
+                bordercolor="#e2e7ea",
+                lightcolor=color,
+                darkcolor=color,
+                thickness=5,
+            )
         style.configure(
             "Horizontal.TProgressbar",
             background=ACCENT,
@@ -861,14 +903,16 @@ class ArchiveClientApp(tk.Tk):
         self.profile_combo.grid(row=0, column=0, padx=(0, 8))
         self.profile_combo.bind("<<ComboboxSelected>>", self._select_profile)
         self.add_profile_button = ttk.Button(
-            tools, text="新增配置", command=self.new_profile
+            tools, text="+ 新增配置", command=self.new_profile
         )
         self.add_profile_button.grid(row=0, column=1, padx=(0, 8))
-        self.settings_button = ttk.Button(tools, text="设置", command=self.open_settings)
+        self.settings_button = ttk.Button(
+            tools, text="⚙ 设置", command=self.open_settings
+        )
         self.settings_button.grid(row=0, column=2, padx=(0, 8))
         self.refresh_button = ttk.Button(
             tools,
-            text="刷新",
+            text="↻ 刷新",
             command=lambda: self.refresh(force=True),
         )
         self.refresh_button.grid(row=0, column=3)
@@ -896,6 +940,7 @@ class ArchiveClientApp(tk.Tk):
             "local": tk.StringVar(value="--"),
             "schedule": tk.StringVar(value=self._schedule_summary()),
         }
+        self.capacity_bars: dict[str, ttk.Progressbar] = {}
         for index, (name, label) in enumerate(
             (
                 ("drive", "Google Drive 账号"),
@@ -936,6 +981,13 @@ class ArchiveClientApp(tk.Tk):
                     text="免费额度",
                     style="MetricNote.TLabel",
                 ).pack(side="left", padx=(4, 0), anchor="s")
+                self.capacity_bars["r2"] = ttk.Progressbar(
+                    cell,
+                    style="R2.Horizontal.TProgressbar",
+                    mode="determinate",
+                    maximum=100,
+                )
+                self.capacity_bars["r2"].pack(fill="x", pady=(5, 0))
             else:
                 ttk.Label(cell, text=label, style="MetricName.TLabel").pack(anchor="w")
                 ttk.Label(
@@ -943,6 +995,14 @@ class ArchiveClientApp(tk.Tk):
                     textvariable=self.metric_vars[name],
                     style="Metric.TLabel",
                 ).pack(anchor="w", pady=(3, 0))
+                if name == "drive":
+                    self.capacity_bars["drive"] = ttk.Progressbar(
+                        cell,
+                        style="Drive.Horizontal.TProgressbar",
+                        mode="determinate",
+                        maximum=100,
+                    )
+                    self.capacity_bars["drive"].pack(fill="x", pady=(5, 0))
             if index < 3:
                 ttk.Separator(metrics, orient="vertical").grid(
                     row=0,
@@ -957,34 +1017,37 @@ class ArchiveClientApp(tk.Tk):
         action_bar.columnconfigure(6, weight=1)
         self.download_button = ttk.Button(
             action_bar,
-            text="下载选中日期",
+            text="↓ 下载选中日期",
             style="Primary.TButton",
             command=self.download_selected,
         )
         self.download_button.grid(row=0, column=0)
         self.verify_button = ttk.Button(
-            action_bar, text="重新校验", command=self.verify_selected
+            action_bar, text="✓ 重新校验", command=self.verify_selected
         )
         self.verify_button.grid(row=0, column=1, padx=(8, 0))
         self.cancel_button = ttk.Button(
             action_bar,
-            text="取消当前任务",
+            text="× 取消当前任务",
             command=self.cancel_current_operation,
             state="disabled",
         )
         self.cancel_button.grid(row=0, column=2, padx=(8, 0))
         self.reports_button = ttk.Button(
-            action_bar, text="打开报告", command=self.open_reports
+            action_bar, text="≡ 打开报告", command=self.open_reports
         )
         self.reports_button.grid(row=0, column=3, padx=(8, 0))
         self.local_button = ttk.Button(
-            action_bar, text="打开本地目录", command=self.open_local_root
+            action_bar, text="▣ 打开本地目录", command=self.open_local_root
         )
         self.local_button.grid(row=0, column=4, padx=(8, 0))
-        self.schedule_button = ttk.Button(
+        self.schedule_toggle_var = tk.BooleanVar(value=self.schedule_installed)
+        self.schedule_button = ttk.Checkbutton(
             action_bar,
-            text="停止自动同步" if self.schedule_installed else "启用自动同步",
+            text="↻ 自动同步",
+            variable=self.schedule_toggle_var,
             command=self.toggle_schedule,
+            style="Sync.Toolbutton",
         )
         self.schedule_button.grid(row=0, column=7, sticky="e")
 
@@ -994,8 +1057,9 @@ class ArchiveClientApp(tk.Tk):
             highlightbackground="#c9dfe7",
             highlightthickness=1,
             padx=14,
-            pady=9,
+            pady=7,
         )
+        self.result_frame.columnconfigure(1, weight=1)
         self.result_title_var = tk.StringVar()
         self.result_detail_var = tk.StringVar()
         self.result_title_label = tk.Label(
@@ -1005,7 +1069,7 @@ class ArchiveClientApp(tk.Tk):
             fg=ACCENT,
             font=("Segoe UI Semibold", 9),
         )
-        self.result_title_label.pack(anchor="w")
+        self.result_title_label.grid(row=0, column=0, sticky="nw")
         self.result_detail_label = tk.Label(
             self.result_frame,
             textvariable=self.result_detail_var,
@@ -1014,12 +1078,21 @@ class ArchiveClientApp(tk.Tk):
             font=("Segoe UI", 9),
             wraplength=820,
             justify="left",
+            anchor="w",
         )
-        self.result_detail_label.pack(anchor="w", pady=(3, 0))
+        self.result_detail_label.grid(
+            row=0,
+            column=1,
+            sticky="new",
+            padx=(8, 0),
+        )
         self.result_frame.bind(
             "<Configure>",
             lambda event: self.result_detail_label.configure(
-                wraplength=max(event.width - 28, 320)
+                wraplength=max(
+                    event.width - self.result_title_label.winfo_reqwidth() - 50,
+                    320,
+                )
             ),
         )
 
@@ -1060,6 +1133,8 @@ class ArchiveClientApp(tk.Tk):
                 anchor="w",
                 stretch=column == "detail",
             )
+        self.table.tag_configure("stripe_even", background=SURFACE)
+        self.table.tag_configure("stripe_odd", background="#f5f7f9")
         self.table.tag_configure("ok", foreground=INK)
         self.table.tag_configure("loading", foreground=BLUE, background=PALE_BLUE)
         self.table.tag_configure("warn", foreground=AMBER, background=PALE_AMBER)
@@ -1297,6 +1372,7 @@ class ArchiveClientApp(tk.Tk):
             self.verify_button,
             self.settings_button,
             self.add_profile_button,
+            self.schedule_button,
         ):
             button.configure(state=state)
         self.cancel_button.configure(
@@ -1525,7 +1601,7 @@ class ArchiveClientApp(tk.Tk):
 
     def _on_table_selection(self, _event: tk.Event | None = None) -> None:
         count = len(self.table.selection())
-        text = "下载选中日期" if count <= 1 else f"下载选中日期（{count}）"
+        text = "↓ 下载选中日期" if count <= 1 else f"↓ 下载选中日期（{count}）"
         self.download_button.configure(text=text)
 
     def _progress_callback(self, name: str, current: int, total: int) -> None:
@@ -1815,6 +1891,7 @@ class ArchiveClientApp(tk.Tk):
                     "确认删除同步所有启用配置的 Windows 自动任务？",
                     parent=self,
                 ):
+                    self.schedule_toggle_var.set(True)
                     return
                 remove_task()
             else:
@@ -1828,15 +1905,14 @@ class ArchiveClientApp(tk.Tk):
                 except Exception as exc:
                     first_run_error = str(exc)
         except Exception as exc:
+            self.schedule_toggle_var.set(task_installed())
             self._show_result("计划任务失败", str(exc), "error")
             self.show_archive_tab()
             return
         self.schedule_installed = task_installed()
         self._startup_sync_pending = False
+        self.schedule_toggle_var.set(self.schedule_installed)
         self.metric_vars["schedule"].set(self._schedule_summary())
-        self.schedule_button.configure(
-            text="停止自动同步" if self.schedule_installed else "启用自动同步"
-        )
         if self.schedule_installed:
             target_date = utc_yesterday()
             if first_run_error:
@@ -1939,8 +2015,19 @@ class ArchiveClientApp(tk.Tk):
         self.metric_vars["r2"].set(r2_metric)
         self.metric_vars["r2_capacity"].set(r2_capacity)
         self.metric_vars["local"].set(local_metric)
+        drive_total = int(drive_usage.get("total_bytes") or 0)
+        drive_used = int(drive_usage.get("used_bytes") or 0)
+        r2_used = int(r2_usage.get("bucket_bytes") or 0)
+        self.capacity_bars["drive"].configure(
+            value=min(drive_used / drive_total * 100, 100) if drive_total else 0
+        )
+        self.capacity_bars["r2"].configure(
+            value=min(r2_used / R2_FREE_ALLOWANCE_BYTES * 100, 100)
+        )
 
-    def _render_row(self, row: ArchiveDayStatus) -> None:
+    def _render_row(
+        self, row: ArchiveDayStatus, row_index: int | None = None
+    ) -> None:
         match_text = (
             "✓ 一致"
             if row.replicas_match is True
@@ -1985,10 +2072,16 @@ class ArchiveClientApp(tk.Tk):
             detail,
         )
         if self.table.exists(row.archive_date):
-            self.table.item(row.archive_date, values=values, tags=(tag,))
+            if row_index is None:
+                row_index = self.table.index(row.archive_date)
+            stripe = "stripe_odd" if row_index % 2 else "stripe_even"
+            self.table.item(row.archive_date, values=values, tags=(tag, stripe))
         else:
+            if row_index is None:
+                row_index = len(self.table.get_children())
+            stripe = "stripe_odd" if row_index % 2 else "stripe_even"
             self.table.insert(
-                "", "end", iid=row.archive_date, values=values, tags=(tag,)
+                "", "end", iid=row.archive_date, values=values, tags=(tag, stripe)
             )
 
     def _handle_scan_rows(self, rows: list[ArchiveDayStatus]) -> None:
@@ -1999,7 +2092,7 @@ class ArchiveClientApp(tk.Tk):
             self.table.delete(archive_date)
         self.rows = {row.archive_date: row for row in rows}
         for index, row in enumerate(rows):
-            self._render_row(row)
+            self._render_row(row, index)
             self.table.move(row.archive_date, "", index)
         retained = tuple(
             row.archive_date for row in rows if row.archive_date in selected
