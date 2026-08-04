@@ -58,6 +58,10 @@ def install_task(entrypoint: Path | None = None) -> None:
     )
 
 
+def run_task() -> None:
+    _run(["/Run", "/TN", TASK_NAME])
+
+
 def remove_task() -> None:
     _run(["/Delete", "/TN", TASK_NAME, "/F"])
 

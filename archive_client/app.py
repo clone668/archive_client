@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import os
+import json
 import logging
+import os
 import queue
 import subprocess
 import sys
@@ -12,9 +13,9 @@ from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import AppConfig, ConfigStore
+from .config import AppConfig, ConfigStore, app_data_dir
 from .credentials import CredentialStore
-from .manager import ArchiveManager, replica_label
+from .manager import ArchiveManager, replica_label, utc_yesterday
 from .models import (
     ArchiveDayStatus,
     BatchDownloadResult,
@@ -23,7 +24,7 @@ from .models import (
     OperationCancelled,
 )
 from .remotes import DriveRemote, R2Remote, resolve_rclone_binary
-from .scheduler import install_task, remove_task, task_installed
+from .scheduler import install_task, remove_task, run_task, task_installed
 
 
 BG = "#f3f5f7"
@@ -83,7 +84,7 @@ STATE_TEXT = {
     "cleaned": "✓ 已清理",
     "missing": "○ 缺失",
     "error": "! 异常",
-    "partial": "! 下载中断",
+    "partial": "○ 下载未完成",
     "unverified": "? 未验证",
 }
 
@@ -530,6 +531,7 @@ class SettingsPanel(ttk.Frame):
 class ArchiveClientApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        self.withdraw()
         self.title("SMSI 归档客户端")
         self.geometry("1180x780")
         self.minsize(940, 640)
@@ -557,10 +559,13 @@ class ArchiveClientApp(tk.Tk):
         self._speed_sample_at: float | None = None
         self._speed_sample_bytes = 0
         self._transfer_speed: float | None = None
+        self._scheduled_run_started_at: float | None = None
         self.schedule_installed = task_installed()
         self._configure_styles()
         self._load_app_icon()
         self._build()
+        self._center_window()
+        self.deiconify()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_events)
         self.after(250, self.refresh)
@@ -577,6 +582,14 @@ class ArchiveClientApp(tk.Tk):
     @property
     def profile_count(self) -> int:
         return len(self.profiles)
+
+    def _center_window(self) -> None:
+        self.update_idletasks()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        x = max((self.winfo_screenwidth() - width) // 2, 0)
+        y = max((self.winfo_screenheight() - height) // 2, 0)
+        self.geometry(f"{width}x{height}+{x}+{y}")
 
     def _load_app_icon(self) -> None:
         self._app_icon: tk.PhotoImage | None = None
@@ -1323,7 +1336,64 @@ class ArchiveClientApp(tk.Tk):
         if not self.schedule_installed:
             return "未启用"
         enabled = sum(profile.enabled for profile in self.profiles)
-        return f"已启用 · {enabled} 配置"
+        return f"已启用 · {enabled} 配置 · 每 30 分钟"
+
+    def _poll_scheduled_run(self) -> None:
+        started_at = self._scheduled_run_started_at
+        if self._closing or started_at is None:
+            return
+        log_dir = app_data_dir() / "logs"
+        candidates = [
+            path
+            for path in log_dir.glob("sync-*.json")
+            if path.stat().st_mtime >= started_at - 1
+        ]
+        if not candidates:
+            if time.time() - started_at < 6 * 60 * 60:
+                self.after(2_000, self._poll_scheduled_run)
+            else:
+                self._scheduled_run_started_at = None
+                self._show_result(
+                    "自动同步仍未返回结果",
+                    "请检查 Windows 计划任务状态和同步审计日志。",
+                    "warning",
+                )
+            return
+        log_path = max(candidates, key=lambda path: path.stat().st_mtime)
+        try:
+            payload = json.loads(log_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self.after(1_000, self._poll_scheduled_run)
+            return
+        self._scheduled_run_started_at = None
+        profiles = payload.get("profiles") or []
+        failures = [
+            f"{item.get('display_name') or item.get('profile_id') or '未知配置'}："
+            f"{item.get('error') or '未知错误'}"
+            for item in profiles
+            if not item.get("success")
+        ]
+        if payload.get("success"):
+            self._show_result(
+                "自动同步完成",
+                f"已完成 {len(profiles)} 个启用配置；列表正在刷新。",
+                "success",
+            )
+        else:
+            self._show_result(
+                "自动同步失败",
+                "\n".join(failures) or "审计结果未包含具体失败原因。",
+                "error",
+            )
+        self._refresh_after_scheduled_run()
+
+    def _refresh_after_scheduled_run(self) -> None:
+        if self._closing:
+            return
+        if self.busy:
+            self.after(1_000, self._refresh_after_scheduled_run)
+            return
+        self.refresh(force=True)
 
     def _worker(self, task: Callable[[], Any], success_event: str) -> None:
         def run() -> None:
@@ -1666,6 +1736,7 @@ class ArchiveClientApp(tk.Tk):
             self._show_result("无法打开目录", str(exc), "error")
 
     def toggle_schedule(self) -> None:
+        first_run_error = ""
         try:
             if task_installed():
                 if not messagebox.askyesno(
@@ -1677,6 +1748,17 @@ class ArchiveClientApp(tk.Tk):
                 remove_task()
             else:
                 install_task()
+                if not task_installed():
+                    raise RuntimeError(
+                        "Windows 计划任务创建后未能读取，请检查任务计划程序"
+                    )
+                try:
+                    first_run_started_at = time.time()
+                    run_task()
+                    self._scheduled_run_started_at = first_run_started_at
+                    self.after(2_000, self._poll_scheduled_run)
+                except Exception as exc:
+                    first_run_error = str(exc)
         except Exception as exc:
             self._show_result("计划任务失败", str(exc), "error")
             self.show_archive_tab()
@@ -1686,11 +1768,25 @@ class ArchiveClientApp(tk.Tk):
         self.schedule_button.configure(
             text="停止自动同步" if self.schedule_installed else "启用自动同步"
         )
-        self._show_result(
-            "自动同步已启用" if self.schedule_installed else "自动同步已停止",
-            self._schedule_summary(),
-            "success",
-        )
+        if self.schedule_installed:
+            target_date = utc_yesterday()
+            if first_run_error:
+                self._show_result(
+                    "自动同步已启用，但首次同步启动失败",
+                    f"目标 UTC 日期：{target_date}\n{first_run_error}",
+                    "warning",
+                )
+            else:
+                self._show_result(
+                    "自动同步已启用，首次同步已启动",
+                    (
+                        f"正在后台补齐所有启用配置的 UTC 日期 {target_date}。"
+                        "此后每 30 分钟检查一次；本次完成后列表会自动刷新。"
+                    ),
+                    "success",
+                )
+        else:
+            self._show_result("自动同步已停止", "Windows 计划任务已删除。", "success")
 
     def _render_metrics(self) -> None:
         rows = list(self.rows.values())
