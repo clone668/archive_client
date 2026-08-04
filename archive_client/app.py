@@ -481,7 +481,11 @@ class ArchiveClientApp(tk.Tk):
         self.add_profile_button.pack(side="left", padx=(0, 8))
         self.settings_button = ttk.Button(tools, text="设置", command=self.open_settings)
         self.settings_button.pack(side="left", padx=(0, 8))
-        self.refresh_button = ttk.Button(tools, text="刷新", command=self.refresh)
+        self.refresh_button = ttk.Button(
+            tools,
+            text="刷新",
+            command=lambda: self.refresh(force=True),
+        )
         self.refresh_button.pack(side="left")
         self._sync_profile_selector()
 
@@ -755,15 +759,18 @@ class ArchiveClientApp(tk.Tk):
 
         threading.Thread(target=run, daemon=True).start()
 
-    def refresh(self) -> None:
+    def refresh(self, *, force: bool = False) -> None:
         if self.busy:
             return
-        self._set_busy(True, "正在读取双云端清单")
+        self._set_busy(True, "正在并行读取双云端清单")
         self._reset_transfer_metrics()
         self.progress_percent_var.set("")
         self.progress.configure(mode="indeterminate")
         self.progress.start(12)
-        self._worker(self.manager.scan_dashboard, "scan")
+        self._worker(
+            lambda: self.manager.scan_dashboard(force_refresh=force),
+            "scan",
+        )
 
     def _selected_dates(self) -> tuple[str, ...]:
         selected = set(self.table.selection())

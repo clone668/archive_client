@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -33,6 +36,7 @@ REPLICA_LABELS = {
     "google_drive": "Google Drive",
     "r2": "Cloudflare R2",
 }
+DASHBOARD_MANIFEST_CACHE_SECONDS = 300
 
 
 def replica_label(value: str) -> str:
@@ -91,6 +95,10 @@ class ArchiveManager:
             except Exception as exc:
                 r2 = UnavailableRemote("r2", str(exc))
         self.r2 = r2
+        self._dashboard_manifest_cache: dict[
+            tuple[str, str], tuple[float, ReplicaDayStatus]
+        ] = {}
+        self._dashboard_cache_lock = threading.Lock()
 
     @property
     def collector_root(self) -> Path:
@@ -236,23 +244,39 @@ class ArchiveManager:
             return "unverified", "本地验证未通过"
         return "verified", f"{int(value.get('object_count') or 0)} 个对象"
 
-    @staticmethod
     def _remote_status(
-        remote: ArchiveRemote, archive_date: str, available_dates: set[str]
+        self,
+        remote_name: str,
+        remote: ArchiveRemote,
+        archive_date: str,
+        available_dates: set[str],
+        force_refresh: bool = False,
     ) -> ReplicaDayStatus:
         if archive_date not in available_dates:
             return ReplicaDayStatus("missing", "云端无此日期")
+        cache_key = (remote_name, archive_date)
+        now = time.monotonic()
+        if not force_refresh:
+            with self._dashboard_cache_lock:
+                cached = self._dashboard_manifest_cache.get(cache_key)
+            if cached and now - cached[0] < DASHBOARD_MANIFEST_CACHE_SECONDS:
+                return cached[1]
         try:
             snapshot = remote.fetch_manifest(archive_date)
         except Exception as exc:
             return ReplicaDayStatus("error", str(exc))
-        return ReplicaDayStatus(
+        status = ReplicaDayStatus(
             "verified",
             f"{snapshot.object_count} 对象 / {snapshot.row_count:,} 行",
             snapshot,
         )
+        with self._dashboard_cache_lock:
+            self._dashboard_manifest_cache[cache_key] = (now, status)
+        return status
 
-    def scan(self) -> tuple[list[ArchiveDayStatus], list[str]]:
+    def scan(
+        self, force_refresh: bool = False
+    ) -> tuple[list[ArchiveDayStatus], list[str]]:
         errors: list[str] = []
         local_errors = [
             *self.config.validate_identity(),
@@ -260,16 +284,24 @@ class ArchiveManager:
         ]
         if local_errors:
             return [], ["本地归档配置无效：" + "；".join(local_errors)]
-        try:
-            drive_dates = self.drive.list_dates()
-        except Exception as exc:
-            drive_dates = set()
-            errors.append(f"Google Drive: {exc}")
-        try:
-            r2_dates = self.r2.list_dates()
-        except Exception as exc:
-            r2_dates = set()
-            errors.append(f"Cloudflare R2: {exc}")
+        date_sources = (
+            ("Google Drive", self.drive),
+            ("Cloudflare R2", self.r2),
+        )
+        available_dates: dict[str, set[str]] = {}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                label: executor.submit(remote.list_dates)
+                for label, remote in date_sources
+            }
+            for label, _remote in date_sources:
+                try:
+                    available_dates[label] = futures[label].result()
+                except Exception as exc:
+                    available_dates[label] = set()
+                    errors.append(f"{label}: {exc}")
+        drive_dates = available_dates["Google Drive"]
+        r2_dates = available_dates["Cloudflare R2"]
         local_dates = {
             path.name.removeprefix("date=")
             for path in self.collector_root.glob("date=????-??-??")
@@ -282,10 +314,33 @@ class ArchiveManager:
             except ValueError:
                 errors.append(f"已忽略非法归档日期：{candidate}")
         dates = dates[: self.config.history_days]
+        remote_statuses: dict[tuple[str, str], ReplicaDayStatus] = {}
+        status_jobs = max(2, min(8, len(dates) * 2))
+        with ThreadPoolExecutor(max_workers=status_jobs) as executor:
+            futures = {}
+            for archive_date in dates:
+                futures[(archive_date, "google_drive")] = executor.submit(
+                    self._remote_status,
+                    "google_drive",
+                    self.drive,
+                    archive_date,
+                    drive_dates,
+                    force_refresh,
+                )
+                futures[(archive_date, "r2")] = executor.submit(
+                    self._remote_status,
+                    "r2",
+                    self.r2,
+                    archive_date,
+                    r2_dates,
+                    force_refresh,
+                )
+            for key, future in futures.items():
+                remote_statuses[key] = future.result()
         rows: list[ArchiveDayStatus] = []
         for archive_date in dates:
-            drive = self._remote_status(self.drive, archive_date, drive_dates)
-            r2 = self._remote_status(self.r2, archive_date, r2_dates)
+            drive = remote_statuses[(archive_date, "google_drive")]
+            r2 = remote_statuses[(archive_date, "r2")]
             cleanup_receipt = self._completed_cleanup_receipt(archive_date)
             if cleanup_receipt:
                 if drive.state == "missing":
@@ -304,15 +359,23 @@ class ArchiveManager:
         return rows, errors
 
     def scan_dashboard(
-        self,
+        self, force_refresh: bool = False
     ) -> tuple[list[ArchiveDayStatus], list[str], dict[str, dict[str, Any]]]:
-        rows, errors = self.scan()
         usage: dict[str, dict[str, Any]] = {}
-        for name, remote in (("google_drive", self.drive), ("r2", self.r2)):
-            try:
-                usage[name] = remote.storage_usage()
-            except Exception as exc:
-                usage[name] = {"error": str(exc)}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            scan_future = executor.submit(self.scan, force_refresh)
+            usage_futures = {
+                name: executor.submit(remote.storage_usage)
+                for name, remote in (("google_drive", self.drive), ("r2", self.r2))
+            }
+            rows, errors = scan_future.result()
+            for name, future in usage_futures.items():
+                try:
+                    usage[name] = future.result()
+                except Exception as exc:
+                    usage[name] = {"error": str(exc)}
+        for name in ("google_drive", "r2"):
+            usage.setdefault(name, {"error": "容量统计没有返回结果"})
         try:
             probe = self.config.archive_root
             while not probe.exists() and probe.parent != probe:

@@ -10,6 +10,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -307,8 +308,11 @@ class DriveRemote(ArchiveRemote):
 
     def fetch_manifest(self, archive_date: str) -> ManifestSnapshot:
         relative = f"date={archive_date}/manifest.json"
-        metadata = self._metadata(relative)
-        raw = self._cat(relative)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            metadata_future = executor.submit(self._metadata, relative)
+            manifest_future = executor.submit(self._cat, relative)
+            metadata = metadata_future.result()
+            raw = manifest_future.result()
         return validate_manifest(
             self.name,
             archive_date,
