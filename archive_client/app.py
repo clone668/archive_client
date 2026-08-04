@@ -562,6 +562,7 @@ class ArchiveClientApp(tk.Tk):
         self._transfer_speed: float | None = None
         self._scheduled_run_started_at: float | None = None
         self.schedule_installed = task_installed()
+        self._startup_sync_pending = self.schedule_installed
         self._configure_styles()
         self._load_app_icon()
         self._build()
@@ -633,7 +634,18 @@ class ArchiveClientApp(tk.Tk):
         style.configure("Muted.TLabel", foreground=MUTED, font=("Segoe UI", 9))
         style.configure("Form.TLabel", background=SURFACE, foreground=INK, font=("Segoe UI", 9))
         style.configure("SectionTitle.TLabel", foreground=INK, font=("Segoe UI Semibold", 11))
-        style.configure("Metric.TLabel", background=SURFACE, foreground=INK, font=("Segoe UI Semibold", 11))
+        style.configure(
+            "Metric.TLabel",
+            background=SURFACE,
+            foreground=INK,
+            font=("Segoe UI Semibold", 9),
+        )
+        style.configure(
+            "MetricNote.TLabel",
+            background=SURFACE,
+            foreground=MUTED,
+            font=("Segoe UI", 8),
+        )
         style.configure("MetricName.TLabel", background=SURFACE, foreground=MUTED, font=("Segoe UI", 8))
         style.configure("Status.TLabel", font=("Segoe UI Semibold", 9), foreground=INK)
         style.configure("Percent.TLabel", font=("Segoe UI Semibold", 9), foreground=ACCENT)
@@ -880,6 +892,7 @@ class ArchiveClientApp(tk.Tk):
         self.metric_vars = {
             "drive": tk.StringVar(value="--"),
             "r2": tk.StringVar(value="--"),
+            "r2_capacity": tk.StringVar(value="--"),
             "local": tk.StringVar(value="--"),
             "schedule": tk.StringVar(value=self._schedule_summary()),
         }
@@ -904,6 +917,25 @@ class ArchiveClientApp(tk.Tk):
                     textvariable=self.metric_vars[name],
                     style="Metric.TLabel",
                 ).pack(anchor="w")
+            elif name == "r2":
+                ttk.Label(cell, text=label, style="MetricName.TLabel").pack(anchor="w")
+                ttk.Label(
+                    cell,
+                    textvariable=self.metric_vars[name],
+                    style="Metric.TLabel",
+                ).pack(anchor="w", pady=(3, 0))
+                r2_capacity = ttk.Frame(cell, style="Surface.TFrame")
+                r2_capacity.pack(anchor="w")
+                ttk.Label(
+                    r2_capacity,
+                    textvariable=self.metric_vars["r2_capacity"],
+                    style="Metric.TLabel",
+                ).pack(side="left")
+                ttk.Label(
+                    r2_capacity,
+                    text="免费额度",
+                    style="MetricNote.TLabel",
+                ).pack(side="left", padx=(4, 0), anchor="s")
             else:
                 ttk.Label(cell, text=label, style="MetricName.TLabel").pack(anchor="w")
                 ttk.Label(
@@ -1348,6 +1380,34 @@ class ArchiveClientApp(tk.Tk):
         enabled = sum(profile.enabled for profile in self.profiles)
         return f"自动同步：已启用 · {enabled} 配置 · 每 30 分钟"
 
+    def _start_scheduled_sync(self) -> None:
+        started_at = time.time()
+        run_task()
+        self._scheduled_run_started_at = started_at
+        self.after(2_000, self._poll_scheduled_run)
+
+    def _run_startup_sync(self) -> None:
+        if self._closing or not self.schedule_installed:
+            return
+        try:
+            self._start_scheduled_sync()
+        except Exception as exc:
+            self._show_result(
+                "启动自动同步检查失败",
+                str(exc),
+                "warning",
+            )
+            return
+        target_date = utc_yesterday()
+        self._show_result(
+            "启动自动同步检查已开始",
+            (
+                f"正在后台检查所有启用配置的 UTC 日期 {target_date}；"
+                "本地缺失时自动下载，已完整验证时不会重复下载。"
+            ),
+            "success",
+        )
+
     def _poll_scheduled_run(self) -> None:
         started_at = self._scheduled_run_started_at
         if self._closing or started_at is None:
@@ -1634,6 +1694,7 @@ class ArchiveClientApp(tk.Tk):
         self.table.delete(*self.table.get_children())
         for name in ("drive", "r2", "local"):
             self.metric_vars[name].set("--")
+        self.metric_vars["r2_capacity"].set("--")
         self.identity_label.configure(
             text=(
                 f"profile={self.config_value.profile_id} · "
@@ -1763,10 +1824,7 @@ class ArchiveClientApp(tk.Tk):
                         "Windows 计划任务创建后未能读取，请检查任务计划程序"
                     )
                 try:
-                    first_run_started_at = time.time()
-                    run_task()
-                    self._scheduled_run_started_at = first_run_started_at
-                    self.after(2_000, self._poll_scheduled_run)
+                    self._start_scheduled_sync()
                 except Exception as exc:
                     first_run_error = str(exc)
         except Exception as exc:
@@ -1774,6 +1832,7 @@ class ArchiveClientApp(tk.Tk):
             self.show_archive_tab()
             return
         self.schedule_installed = task_installed()
+        self._startup_sync_pending = False
         self.metric_vars["schedule"].set(self._schedule_summary())
         self.schedule_button.configure(
             text="停止自动同步" if self.schedule_installed else "启用自动同步"
@@ -1830,31 +1889,29 @@ class ArchiveClientApp(tk.Tk):
             if r2_usage and not r2_usage.get("error"):
                 r2_metric = (
                     f"{r2_ok} 日 · 刷新中 · "
-                    f"{int(r2_usage.get('bucket_objects') or 0):,} 对象\n"
+                    f"{int(r2_usage.get('bucket_objects') or 0):,} 对象"
+                )
+                r2_capacity = (
                     f"上次已用 {human_bytes(int(r2_usage.get('bucket_bytes') or 0))} / "
-                    f"免费额度 {human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
+                    f"{human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
                 )
             else:
-                r2_metric = (
-                    f"{r2_ok} 日 · 读取中\n"
-                    f"免费额度 {human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
-                )
+                r2_metric = f"{r2_ok} 日 · 读取中"
+                r2_capacity = human_bytes(R2_FREE_ALLOWANCE_BYTES)
         elif r2_usage.get("error"):
-            r2_metric = (
-                f"{r2_ok} 日 · 用量读取失败\n"
-                f"免费额度 {human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
-            )
+            r2_metric = f"{r2_ok} 日 · 用量读取失败"
+            r2_capacity = human_bytes(R2_FREE_ALLOWANCE_BYTES)
         elif not r2_usage:
-            r2_metric = (
-                f"{r2_ok} 日 · 用量尚未读取\n"
-                f"免费额度 {human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
-            )
+            r2_metric = f"{r2_ok} 日 · 用量尚未读取"
+            r2_capacity = human_bytes(R2_FREE_ALLOWANCE_BYTES)
         else:
             r2_metric = (
                 f"{r2_ok} 日 · {int(r2_usage.get('bucket_objects') or 0):,} 对象 · "
-                f"归档 {human_bytes(int(r2_usage.get('archive_bytes') or 0))}\n"
+                f"归档 {human_bytes(int(r2_usage.get('archive_bytes') or 0))}"
+            )
+            r2_capacity = (
                 f"已用 {human_bytes(int(r2_usage.get('bucket_bytes') or 0))} / "
-                f"免费额度 {human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
+                f"{human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
             )
 
         local_usage = self.usage.get("local") or {}
@@ -1880,6 +1937,7 @@ class ArchiveClientApp(tk.Tk):
 
         self.metric_vars["drive"].set(drive_metric)
         self.metric_vars["r2"].set(r2_metric)
+        self.metric_vars["r2_capacity"].set(r2_capacity)
         self.metric_vars["local"].set(local_metric)
 
     def _render_row(self, row: ArchiveDayStatus) -> None:
@@ -2071,6 +2129,9 @@ class ArchiveClientApp(tk.Tk):
         self.progress_detail_var.set(
             f"读取完成：{len(rows)} 个日期 · {verified} 个双副本一致"
         )
+        if self._startup_sync_pending:
+            self._startup_sync_pending = False
+            self.after(0, self._run_startup_sync)
 
     def _drain_events(self) -> None:
         try:
