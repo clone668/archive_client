@@ -651,6 +651,30 @@ class ArchiveClientApp(tk.Tk):
             font=("Segoe UI", 8),
         )
         style.configure("MetricName.TLabel", background=SURFACE, foreground=MUTED, font=("Segoe UI", 8))
+        style.configure(
+            "DashboardTitle.TLabel",
+            background=SURFACE,
+            foreground=MUTED,
+            font=("Segoe UI", 8),
+        )
+        style.configure(
+            "DashboardValue.TLabel",
+            background=SURFACE,
+            foreground=INK,
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "DashboardMeta.TLabel",
+            background=SURFACE,
+            foreground=MUTED,
+            font=("Segoe UI", 8),
+        )
+        style.configure(
+            "DashboardStatus.TLabel",
+            background=SURFACE,
+            foreground=ACCENT,
+            font=("Segoe UI", 8),
+        )
         style.configure("Status.TLabel", font=("Segoe UI Semibold", 9), foreground=INK)
         style.configure(
             "Percent.TLabel",
@@ -684,6 +708,7 @@ class ArchiveClientApp(tk.Tk):
             background=[("active", "#e3e9ed"), ("pressed", "#dbe3e8")],
             foreground=[("disabled", "#9aa6b2")],
         )
+        style.configure("Dashboard.TButton", font=("Segoe UI", 8), padding=(6, 2))
         style.configure(
             "Primary.TButton",
             font=("Segoe UI Semibold", 9),
@@ -794,8 +819,8 @@ class ArchiveClientApp(tk.Tk):
             "Sync.Toolbutton",
             background=SURFACE,
             foreground=INK,
-            font=("Segoe UI", 9),
-            padding=(10, 6),
+            font=("Segoe UI", 8),
+            padding=(6, 2),
             bordercolor=BORDER,
             relief="flat",
         )
@@ -929,110 +954,105 @@ class ArchiveClientApp(tk.Tk):
         self.archive_tab.columnconfigure(0, weight=1)
         self.archive_tab.rowconfigure(3, weight=1)
 
-        metrics = ttk.Frame(
+        metrics = tk.Frame(
             self.archive_tab,
-            style="Surface.TFrame",
-            padding=(16, 12),
+            bg=SURFACE,
+            highlightbackground=BORDER,
+            highlightthickness=1,
+            padx=16,
+            pady=8,
         )
         metrics.grid(row=0, column=0, sticky="ew", pady=(12, 0))
         self.metric_vars = {
             "drive": tk.StringVar(value="--"),
+            "drive_detail": tk.StringVar(value="正在读取账号容量"),
             "r2": tk.StringVar(value="--"),
-            "r2_capacity": tk.StringVar(value="--"),
+            "r2_detail": tk.StringVar(value="正在读取 Bucket 用量"),
             "local": tk.StringVar(value="--"),
+            "local_detail": tk.StringVar(value="正在读取磁盘容量"),
             "schedule": tk.StringVar(value=self._schedule_summary()),
+            "schedule_meta": tk.StringVar(value=self._schedule_meta()),
         }
         self.schedule_detail_var = tk.StringVar()
         self.schedule_toggle_var = tk.BooleanVar(value=self.schedule_installed)
         self.capacity_bars: dict[str, ttk.Progressbar] = {}
-        for index, (name, label) in enumerate(
+        for index, (name, label, accent_color) in enumerate(
             (
-                ("drive", "Google Drive 账号"),
-                ("r2", "Cloudflare R2 Bucket"),
-                ("local", "本地归档磁盘"),
-                ("schedule", "自动同步"),
+                ("drive", "Google Drive", "#4285f4"),
+                ("r2", "Cloudflare R2", "#f48120"),
+                ("local", "本地归档磁盘", GREEN),
+                ("schedule", "自动同步", ACCENT),
             )
         ):
             cell = ttk.Frame(metrics, style="Surface.TFrame")
             cell.grid(
                 row=0,
                 column=index * 2,
-                sticky="ew",
+                sticky="nsew",
                 padx=14,
             )
-            ttk.Label(cell, text=label, style="MetricName.TLabel").pack(anchor="w")
+            cell.columnconfigure(0, weight=1)
+            tk.Frame(cell, bg=accent_color, height=2).grid(
+                row=0, column=0, sticky="ew", pady=(0, 7)
+            )
+            cell_header = ttk.Frame(cell, style="Surface.TFrame")
+            cell_header.grid(row=1, column=0, sticky="ew")
+            ttk.Label(
+                cell_header, text=label, style="DashboardTitle.TLabel"
+            ).pack(side="left", anchor="w")
             if name == "schedule":
-                ttk.Label(
-                    cell,
-                    textvariable=self.metric_vars[name],
-                    style="Metric.TLabel",
-                ).pack(anchor="w", pady=(3, 0))
-                ttk.Label(
-                    cell,
-                    textvariable=self.schedule_detail_var,
-                    style="MetricNote.TLabel",
-                ).pack(anchor="w", pady=(5, 0))
                 self.schedule_button = ttk.Checkbutton(
-                    cell,
+                    cell_header,
                     text="↻ 自动同步",
                     variable=self.schedule_toggle_var,
                     command=self.toggle_schedule,
                     style="Sync.Toolbutton",
                 )
-                self.schedule_button.pack(anchor="w", pady=(8, 0))
-            elif name == "r2":
-                ttk.Label(
-                    cell,
-                    textvariable=self.metric_vars[name],
-                    style="Metric.TLabel",
-                ).pack(anchor="w", pady=(3, 0))
-                r2_capacity = ttk.Frame(cell, style="Surface.TFrame")
-                r2_capacity.pack(anchor="w")
-                ttk.Label(
-                    r2_capacity,
-                    textvariable=self.metric_vars["r2_capacity"],
-                    style="Metric.TLabel",
-                ).pack(side="left")
-                ttk.Label(
-                    r2_capacity,
-                    text="免费额度",
-                    style="MetricNote.TLabel",
-                ).pack(side="left", padx=(4, 0), anchor="s")
-                self.capacity_bars["r2"] = ttk.Progressbar(
-                    cell,
-                    style="R2.Horizontal.TProgressbar",
-                    mode="determinate",
-                    maximum=100,
+                self.schedule_button.pack(side="right")
+            elif name == "local":
+                self.local_button = ttk.Button(
+                    cell_header,
+                    text="▣ 打开目录",
+                    command=self.open_local_root,
+                    style="Dashboard.TButton",
                 )
-                self.capacity_bars["r2"].pack(fill="x", pady=(5, 0))
+                self.local_button.pack(side="right")
+            ttk.Label(
+                cell,
+                textvariable=self.metric_vars[name],
+                style="DashboardValue.TLabel",
+            ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+            if name == "schedule":
+                ttk.Label(
+                    cell,
+                    textvariable=self.metric_vars["schedule_meta"],
+                    style="DashboardMeta.TLabel",
+                ).grid(row=3, column=0, sticky="w", pady=(1, 0))
+                ttk.Label(
+                    cell,
+                    textvariable=self.schedule_detail_var,
+                    style="DashboardStatus.TLabel",
+                ).grid(row=4, column=0, sticky="w", pady=(4, 0))
             else:
                 ttk.Label(
                     cell,
-                    textvariable=self.metric_vars[name],
-                    style="Metric.TLabel",
-                ).pack(anchor="w", pady=(3, 0))
-                if name == "drive":
-                    self.capacity_bars["drive"] = ttk.Progressbar(
-                        cell,
-                        style="Drive.Horizontal.TProgressbar",
-                        mode="determinate",
-                        maximum=100,
-                    )
-                    self.capacity_bars["drive"].pack(fill="x", pady=(5, 0))
-                elif name == "local":
-                    self.capacity_bars["local"] = ttk.Progressbar(
-                        cell,
-                        style="Local.Horizontal.TProgressbar",
-                        mode="determinate",
-                        maximum=100,
-                    )
-                    self.capacity_bars["local"].pack(fill="x", pady=(5, 0))
-                    self.local_button = ttk.Button(
-                        cell,
-                        text="▣ 打开本地目录",
-                        command=self.open_local_root,
-                    )
-                    self.local_button.pack(anchor="w", pady=(8, 0))
+                    textvariable=self.metric_vars[f"{name}_detail"],
+                    style="DashboardMeta.TLabel",
+                ).grid(row=3, column=0, sticky="w", pady=(1, 0))
+                bar_style = {
+                    "drive": "Drive.Horizontal.TProgressbar",
+                    "r2": "R2.Horizontal.TProgressbar",
+                    "local": "Local.Horizontal.TProgressbar",
+                }[name]
+                self.capacity_bars[name] = ttk.Progressbar(
+                    cell,
+                    style=bar_style,
+                    mode="determinate",
+                    maximum=100,
+                )
+                self.capacity_bars[name].grid(
+                    row=4, column=0, sticky="ew", pady=(5, 0)
+                )
             if index < 3:
                 ttk.Separator(metrics, orient="vertical").grid(
                     row=0,
@@ -1471,10 +1491,13 @@ class ArchiveClientApp(tk.Tk):
         self.after(100, self._wait_for_safe_close)
 
     def _schedule_summary(self) -> str:
+        return "已启用" if self.schedule_installed else "未启用"
+
+    def _schedule_meta(self) -> str:
         if not self.schedule_installed:
-            return "未启用"
+            return "没有计划任务"
         enabled = sum(profile.enabled for profile in self.profiles)
-        return f"已启用 · {enabled} 配置 · 每 30 分钟"
+        return f"{enabled} 个配置 · 每 30 分钟"
 
     def _start_scheduled_sync(self) -> None:
         started_at = time.time()
@@ -1780,7 +1803,7 @@ class ArchiveClientApp(tk.Tk):
         self.table.delete(*self.table.get_children())
         for name in ("drive", "r2", "local"):
             self.metric_vars[name].set("--")
-        self.metric_vars["r2_capacity"].set("--")
+            self.metric_vars[f"{name}_detail"].set("正在读取")
         self.identity_label.configure(
             text=(
                 f"profile={self.config_value.profile_id} · "
@@ -1789,6 +1812,7 @@ class ArchiveClientApp(tk.Tk):
         )
         self._sync_profile_selector()
         self.metric_vars["schedule"].set(self._schedule_summary())
+        self.metric_vars["schedule_meta"].set(self._schedule_meta())
         self._mount_settings_panel(
             self.config_value,
             status=settings_status,
@@ -1923,6 +1947,7 @@ class ArchiveClientApp(tk.Tk):
         self._startup_sync_pending = False
         self.schedule_toggle_var.set(self.schedule_installed)
         self.metric_vars["schedule"].set(self._schedule_summary())
+        self.metric_vars["schedule_meta"].set(self._schedule_meta())
         self.schedule_detail_var.set("")
         self._update_download_button_state()
         if self.schedule_installed:
@@ -1945,81 +1970,79 @@ class ArchiveClientApp(tk.Tk):
         local_ok = sum(row.local_state == "verified" for row in rows)
 
         drive_usage = self.usage.get("google_drive") or {}
+        drive_metric = f"{drive_ok} 个归档日"
         if "google_drive" in self._usage_refreshing:
             if drive_usage and not drive_usage.get("error"):
-                drive_metric = (
-                    f"{drive_ok} 日 · 刷新中\n"
-                    f"上次已用 {human_bytes(int(drive_usage.get('used_bytes') or 0))} / "
-                    f"总计 {human_bytes(int(drive_usage.get('total_bytes') or 0))}"
+                drive_detail = (
+                    f"刷新中 · 上次 {human_bytes(int(drive_usage.get('used_bytes') or 0))} / "
+                    f"{human_bytes(int(drive_usage.get('total_bytes') or 0))}"
                 )
             else:
-                drive_metric = f"{drive_ok} 日 · 读取中\n正在读取账号容量"
+                drive_detail = "正在读取账号容量"
         elif drive_usage.get("error"):
-            drive_metric = f"{drive_ok} 日\n容量读取失败"
+            drive_detail = "容量读取失败"
         elif not drive_usage:
-            drive_metric = f"{drive_ok} 日\n容量尚未读取"
+            drive_detail = "容量尚未读取"
         else:
-            drive_metric = (
-                f"{drive_ok} 日 · 已用 "
-                f"{human_bytes(int(drive_usage.get('used_bytes') or 0))}\n"
-                f"总计 {human_bytes(int(drive_usage.get('total_bytes') or 0))}"
+            drive_detail = (
+                f"已用 {human_bytes(int(drive_usage.get('used_bytes') or 0))} / "
+                f"{human_bytes(int(drive_usage.get('total_bytes') or 0))}"
             )
 
         r2_usage = self.usage.get("r2") or {}
+        r2_metric = f"{r2_ok} 个归档日"
         if "r2" in self._usage_refreshing:
             if r2_usage and not r2_usage.get("error"):
                 r2_metric = (
-                    f"{r2_ok} 日 · 刷新中 · "
-                    f"{int(r2_usage.get('bucket_objects') or 0):,} 对象"
+                    f"{r2_ok} 个归档日 · "
+                    f"{int(r2_usage.get('bucket_objects') or 0):,} 个对象"
                 )
-                r2_capacity = (
-                    f"上次已用 {human_bytes(int(r2_usage.get('bucket_bytes') or 0))} / "
+                r2_detail = (
+                    f"刷新中 · 上次 {human_bytes(int(r2_usage.get('bucket_bytes') or 0))} / "
                     f"{human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
                 )
             else:
-                r2_metric = f"{r2_ok} 日 · 读取中"
-                r2_capacity = human_bytes(R2_FREE_ALLOWANCE_BYTES)
+                r2_detail = "正在读取 Bucket 用量"
         elif r2_usage.get("error"):
-            r2_metric = f"{r2_ok} 日 · 用量读取失败"
-            r2_capacity = human_bytes(R2_FREE_ALLOWANCE_BYTES)
+            r2_detail = "用量读取失败"
         elif not r2_usage:
-            r2_metric = f"{r2_ok} 日 · 用量尚未读取"
-            r2_capacity = human_bytes(R2_FREE_ALLOWANCE_BYTES)
+            r2_detail = "用量尚未读取"
         else:
             r2_metric = (
-                f"{r2_ok} 日 · {int(r2_usage.get('bucket_objects') or 0):,} 对象 · "
-                f"归档 {human_bytes(int(r2_usage.get('archive_bytes') or 0))}"
+                f"{r2_ok} 个归档日 · "
+                f"{int(r2_usage.get('bucket_objects') or 0):,} 个对象"
             )
-            r2_capacity = (
+            r2_detail = (
                 f"已用 {human_bytes(int(r2_usage.get('bucket_bytes') or 0))} / "
-                f"{human_bytes(R2_FREE_ALLOWANCE_BYTES)}"
+                f"{human_bytes(R2_FREE_ALLOWANCE_BYTES)} · 免费额度"
             )
 
         local_usage = self.usage.get("local") or {}
+        local_metric = f"{local_ok} 个归档日"
         if "local" in self._usage_refreshing:
             if local_usage and not local_usage.get("error"):
-                local_metric = (
-                    f"{local_ok} 日 · 刷新中\n"
-                    f"上次已用 {human_bytes(int(local_usage.get('used_bytes') or 0))} / "
-                    f"总计 {human_bytes(int(local_usage.get('total_bytes') or 0))}"
+                local_detail = (
+                    f"刷新中 · 上次 {human_bytes(int(local_usage.get('used_bytes') or 0))} / "
+                    f"{human_bytes(int(local_usage.get('total_bytes') or 0))}"
                 )
             else:
-                local_metric = f"{local_ok} 日 · 读取中\n正在读取磁盘容量"
+                local_detail = "正在读取磁盘容量"
         elif local_usage.get("error"):
-            local_metric = f"{local_ok} 日\n磁盘容量读取失败"
+            local_detail = "磁盘容量读取失败"
         elif not local_usage:
-            local_metric = f"{local_ok} 日\n磁盘容量尚未读取"
+            local_detail = "磁盘容量尚未读取"
         else:
-            local_metric = (
-                f"{local_ok} 日 · 已用 "
-                f"{human_bytes(int(local_usage.get('used_bytes') or 0))}\n"
-                f"总计 {human_bytes(int(local_usage.get('total_bytes') or 0))}"
+            local_detail = (
+                f"已用 {human_bytes(int(local_usage.get('used_bytes') or 0))} / "
+                f"{human_bytes(int(local_usage.get('total_bytes') or 0))}"
             )
 
         self.metric_vars["drive"].set(drive_metric)
+        self.metric_vars["drive_detail"].set(drive_detail)
         self.metric_vars["r2"].set(r2_metric)
-        self.metric_vars["r2_capacity"].set(r2_capacity)
+        self.metric_vars["r2_detail"].set(r2_detail)
         self.metric_vars["local"].set(local_metric)
+        self.metric_vars["local_detail"].set(local_detail)
         drive_total = int(drive_usage.get("total_bytes") or 0)
         drive_used = int(drive_usage.get("used_bytes") or 0)
         r2_used = int(r2_usage.get("bucket_bytes") or 0)
