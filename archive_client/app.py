@@ -89,6 +89,98 @@ STATE_TEXT = {
 }
 
 
+class ThinProgressbar(tk.Canvas):
+    def __init__(
+        self,
+        parent: tk.Widget,
+        *,
+        maximum: float = 100,
+        value: float = 0,
+        mode: str = "determinate",
+    ) -> None:
+        super().__init__(
+            parent,
+            background="#d5dee4",
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        self._maximum = maximum
+        self._value = value
+        self._mode = mode
+        self._phase = 0.0
+        self._animation_interval = 24
+        self._animation_job: str | None = None
+        self.bind("<Configure>", lambda _event: self._render())
+
+    def configure(self, cnf: Any = None, **kwargs: Any) -> Any:
+        if cnf is None and not kwargs:
+            return super().configure()
+        if isinstance(cnf, dict):
+            kwargs = {**cnf, **kwargs}
+        elif cnf is not None:
+            return super().configure(cnf, **kwargs)
+
+        if "maximum" in kwargs:
+            self._maximum = float(kwargs.pop("maximum"))
+        if "value" in kwargs:
+            self._value = float(kwargs.pop("value"))
+        if "mode" in kwargs:
+            self._mode = str(kwargs.pop("mode"))
+        result = super().configure(**kwargs) if kwargs else None
+        self._render()
+        return result
+
+    config = configure
+
+    def start(self, interval: int = 24) -> None:
+        self.stop()
+        self._mode = "indeterminate"
+        self._animation_interval = max(int(interval), 16)
+        self._phase = min(max(self._value / max(self._maximum, 1), 0), 1)
+        self._tick()
+
+    def stop(self) -> None:
+        if self._animation_job is None:
+            return
+        try:
+            self.after_cancel(self._animation_job)
+        except tk.TclError:
+            pass
+        self._animation_job = None
+
+    def destroy(self) -> None:
+        self.stop()
+        super().destroy()
+
+    def _tick(self) -> None:
+        self._phase = (self._phase + 0.025) % 1
+        self._render()
+        self._animation_job = self.after(self._animation_interval, self._tick)
+
+    def _render(self) -> None:
+        width = max(self.winfo_width(), 1)
+        height = max(self.winfo_height(), 1)
+        self.delete("progress")
+        if self._mode == "indeterminate":
+            chunk_width = max(int(width * 0.14), 48)
+            left = int(self._phase * (width + chunk_width)) - chunk_width
+            right = left + chunk_width
+        else:
+            left = 0
+            ratio = min(max(self._value / max(self._maximum, 1), 0), 1)
+            right = int(width * ratio)
+        if right > 0 and left < width:
+            self.create_rectangle(
+                max(left, 0),
+                0,
+                min(right, width),
+                height,
+                fill=ACCENT,
+                outline="",
+                tags="progress",
+            )
+
+
 class SettingsPanel(ttk.Frame):
     def __init__(
         self,
@@ -695,7 +787,7 @@ class ArchiveClientApp(tk.Tk):
             foreground=[("disabled", "#9aa6b2")],
         )
         style.configure("Dashboard.TButton", font=("Segoe UI", 8), padding=(6, 2))
-        style.configure("TabHeader.TButton", font=("Segoe UI", 8), padding=(8, 3))
+        style.configure("TabHeader.TButton", font=("Segoe UI", 8), padding=(9, 4))
         style.configure(
             "Primary.TButton",
             font=("Segoe UI Semibold", 9),
@@ -789,8 +881,22 @@ class ArchiveClientApp(tk.Tk):
         )
         style.configure(
             "TabHeader.TCombobox",
-            padding=(6, 3),
+            padding=(7, 4),
+            fieldbackground="#f8fafb",
+            background="#f8fafb",
+            foreground=INK,
+            bordercolor="#cbd4dc",
+            lightcolor="#cbd4dc",
+            darkcolor="#cbd4dc",
             arrowsize=12,
+        )
+        style.map(
+            "TabHeader.TCombobox",
+            fieldbackground=[("readonly", "#f8fafb")],
+            background=[("readonly", "#f8fafb"), ("active", "#eef3f6")],
+            foreground=[("readonly", INK)],
+            selectbackground=[("readonly", "#f8fafb")],
+            selectforeground=[("readonly", INK)],
         )
         style.configure(
             "TSpinbox",
@@ -871,16 +977,6 @@ class ArchiveClientApp(tk.Tk):
                 darkcolor=color,
                 thickness=2,
             )
-        style.configure(
-            "Horizontal.TProgressbar",
-            background=ACCENT,
-            troughcolor="#dfe6ea",
-            bordercolor="#dfe6ea",
-            lightcolor=ACCENT,
-            darkcolor=ACCENT,
-            thickness=8,
-        )
-
     def _build(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -890,8 +986,8 @@ class ArchiveClientApp(tk.Tk):
             row=0,
             column=0,
             sticky="nsew",
-            padx=14,
-            pady=(8, 10),
+            padx=8,
+            pady=(4, 6),
         )
         tab_shell.columnconfigure(0, weight=1)
         tab_shell.rowconfigure(0, weight=1)
@@ -906,15 +1002,16 @@ class ArchiveClientApp(tk.Tk):
         self.archive_tab.rowconfigure(3, weight=1)
 
         tools = ttk.Frame(tab_shell)
-        tools.place(relx=1.0, x=-6, y=2, anchor="ne")
+        tools.place(relx=1.0, x=0, y=1, anchor="ne")
         self.profile_var = tk.StringVar()
         self.profile_choice_to_id: dict[str, str] = {}
+        self.profile_id_to_choice: dict[str, str] = {}
         self.profile_combo = ttk.Combobox(
             tools,
             textvariable=self.profile_var,
             state="readonly",
             style="TabHeader.TCombobox",
-            width=30,
+            width=20,
         )
         self.profile_combo.grid(row=0, column=0, padx=(0, 6))
         self.profile_combo.bind("<<ComboboxSelected>>", self._select_profile)
@@ -1203,10 +1300,7 @@ class ArchiveClientApp(tk.Tk):
         )
         progress_slot.grid(row=1, column=0, sticky="ew")
         progress_slot.pack_propagate(False)
-        self.progress = ttk.Progressbar(
-            progress_slot,
-            mode="determinate",
-        )
+        self.progress = ThinProgressbar(progress_slot)
         self.progress.pack(fill="both", expand=True)
 
         self.settings_panel: SettingsPanel | None = None
@@ -1591,9 +1685,11 @@ class ArchiveClientApp(tk.Tk):
             "同时读取 Google Drive、Cloudflare R2 与容量信息"
         )
         self.progress_percent_var.set("")
-        self.progress.configure(mode="indeterminate")
-        self.progress.start(12)
+        self.progress.stop()
+        self.progress.configure(mode="indeterminate", maximum=100, value=8)
+        self.progress.start(24)
         self._render_metrics()
+        self.update_idletasks()
 
         def report(event: str, payload: Any) -> None:
             self.events.put(("scan_update", (event, payload)))
@@ -1739,18 +1835,37 @@ class ArchiveClientApp(tk.Tk):
         self.show_settings_tab()
 
     def _sync_profile_selector(self) -> None:
-        self.profile_choice_to_id = {
-            profile.label: profile.profile_id for profile in self.profiles
-        }
+        names = [
+            profile.display_name.strip() or profile.profile_id
+            for profile in self.profiles
+        ]
+        name_counts = {name: names.count(name) for name in names}
+        self.profile_choice_to_id = {}
+        self.profile_id_to_choice = {}
+        for profile, name in zip(self.profiles, names):
+            choice = (
+                name
+                if name_counts[name] == 1
+                else f"{name} ({profile.profile_id})"
+            )
+            self.profile_choice_to_id[choice] = profile.profile_id
+            self.profile_id_to_choice[profile.profile_id] = choice
         self.profile_combo.configure(values=list(self.profile_choice_to_id))
-        self.profile_var.set(self.config_value.label)
+        self.profile_var.set(
+            self.profile_id_to_choice.get(
+                self.config_value.profile_id,
+                self.config_value.display_name.strip() or self.config_value.profile_id,
+            )
+        )
 
     def _select_profile(self, _event: tk.Event | None = None) -> None:
         profile_id = self.profile_choice_to_id.get(self.profile_var.get())
         if not profile_id or profile_id == self.config_value.profile_id:
             return
         if self.settings_panel and self.settings_panel.tests_running:
-            self.profile_var.set(self.config_value.label)
+            self.profile_var.set(
+                self.profile_id_to_choice[self.config_value.profile_id]
+            )
             self.show_settings_tab()
             self.settings_panel.set_status(
                 "连接测试尚未完成，暂时不能切换配置。",
@@ -1760,7 +1875,9 @@ class ArchiveClientApp(tk.Tk):
         try:
             self.config_store.set_active(profile_id)
         except Exception as exc:
-            self.profile_var.set(self.config_value.label)
+            self.profile_var.set(
+                self.profile_id_to_choice[self.config_value.profile_id]
+            )
             self._show_result("无法切换配置", str(exc), "error")
             self.show_archive_tab()
             return
