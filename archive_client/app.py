@@ -623,18 +623,6 @@ class ArchiveClientApp(tk.Tk):
             foreground=INK,
             font=("Segoe UI", 9),
         )
-        style.configure(
-            "HeaderTitle.TLabel",
-            background=HEADER_BG,
-            foreground=INK,
-            font=("Segoe UI Semibold", 16),
-        )
-        style.configure(
-            "HeaderMeta.TLabel",
-            background=HEADER_BG,
-            foreground=MUTED,
-            font=("Segoe UI", 9),
-        )
         style.configure("Muted.TLabel", foreground=MUTED, font=("Segoe UI", 9))
         style.configure("Form.TLabel", background=SURFACE, foreground=INK, font=("Segoe UI", 9))
         style.configure("SectionTitle.TLabel", foreground=INK, font=("Segoe UI Semibold", 11))
@@ -835,6 +823,13 @@ class ArchiveClientApp(tk.Tk):
             bordercolor=[("selected", "#bcdcc9"), ("active", BORDER)],
         )
         style.configure(
+            "Metrics.Vertical.TSeparator",
+            background=BORDER,
+            bordercolor=BORDER,
+            lightcolor=BORDER,
+            darkcolor=BORDER,
+        )
+        style.configure(
             "Treeview",
             rowheight=29,
             font=("Segoe UI", 9),
@@ -877,7 +872,7 @@ class ArchiveClientApp(tk.Tk):
                 bordercolor="#e2e7ea",
                 lightcolor=color,
                 darkcolor=color,
-                thickness=5,
+                thickness=2,
             )
         style.configure(
             "Horizontal.TProgressbar",
@@ -893,36 +888,12 @@ class ArchiveClientApp(tk.Tk):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
-        header = ttk.Frame(self, style="Header.TFrame", padding=(18, 12, 18, 12))
+        header = ttk.Frame(self, style="Header.TFrame", padding=(14, 8))
         header.grid(row=0, column=0, sticky="ew")
-        header.columnconfigure(1, weight=1)
-        self._header_icon = (
-            self._app_icon.subsample(2, 2) if self._app_icon is not None else None
-        )
-        icon_label = ttk.Label(
-            header,
-            image=self._header_icon,
-            text="S" if self._header_icon is None else "",
-            style="HeaderTitle.TLabel",
-        )
-        icon_label.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 11))
-        ttk.Label(
-            header,
-            text="SMSI 归档客户端",
-            style="HeaderTitle.TLabel",
-        ).grid(row=0, column=1, sticky="sw")
-        self.identity_label = ttk.Label(
-            header,
-            text=(
-                f"profile={self.config_value.profile_id} · "
-                f"collector={self.config_value.collector_id}"
-            ),
-            style="HeaderMeta.TLabel",
-        )
-        self.identity_label.grid(row=1, column=1, sticky="nw", pady=(2, 0))
+        header.columnconfigure(0, weight=1)
 
         tools = ttk.Frame(header, style="Header.TFrame")
-        tools.grid(row=0, column=2, rowspan=2, sticky="e")
+        tools.grid(row=0, column=0, sticky="e")
         self.profile_var = tk.StringVar()
         self.profile_choice_to_id: dict[str, str] = {}
         self.profile_combo = ttk.Combobox(
@@ -976,12 +947,12 @@ class ArchiveClientApp(tk.Tk):
         self.schedule_detail_var = tk.StringVar()
         self.schedule_toggle_var = tk.BooleanVar(value=self.schedule_installed)
         self.capacity_bars: dict[str, ttk.Progressbar] = {}
-        for index, (name, label, accent_color) in enumerate(
+        for index, (name, label) in enumerate(
             (
-                ("drive", "Google Drive", "#4285f4"),
-                ("r2", "Cloudflare R2", "#f48120"),
-                ("local", "本地归档磁盘", GREEN),
-                ("schedule", "自动同步", ACCENT),
+                ("drive", "Google Drive"),
+                ("r2", "Cloudflare R2"),
+                ("local", "本地归档磁盘"),
+                ("schedule", "自动同步"),
             )
         ):
             cell = ttk.Frame(metrics, style="Surface.TFrame")
@@ -992,11 +963,8 @@ class ArchiveClientApp(tk.Tk):
                 padx=14,
             )
             cell.columnconfigure(0, weight=1)
-            tk.Frame(cell, bg=accent_color, height=2).grid(
-                row=0, column=0, sticky="ew", pady=(0, 7)
-            )
             cell_header = ttk.Frame(cell, style="Surface.TFrame")
-            cell_header.grid(row=1, column=0, sticky="ew")
+            cell_header.grid(row=0, column=0, sticky="ew")
             ttk.Label(
                 cell_header, text=label, style="DashboardTitle.TLabel"
             ).pack(side="left", anchor="w")
@@ -1021,40 +989,51 @@ class ArchiveClientApp(tk.Tk):
                 cell,
                 textvariable=self.metric_vars[name],
                 style="DashboardValue.TLabel",
-            ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+            ).grid(row=1, column=0, sticky="w", pady=(4, 0))
             if name == "schedule":
                 ttk.Label(
                     cell,
                     textvariable=self.metric_vars["schedule_meta"],
                     style="DashboardMeta.TLabel",
-                ).grid(row=3, column=0, sticky="w", pady=(1, 0))
+                ).grid(row=2, column=0, sticky="w", pady=(1, 0))
                 ttk.Label(
                     cell,
                     textvariable=self.schedule_detail_var,
                     style="DashboardStatus.TLabel",
-                ).grid(row=4, column=0, sticky="w", pady=(4, 0))
+                ).grid(row=3, column=0, sticky="w", pady=(4, 0))
             else:
                 ttk.Label(
                     cell,
                     textvariable=self.metric_vars[f"{name}_detail"],
                     style="DashboardMeta.TLabel",
-                ).grid(row=3, column=0, sticky="w", pady=(1, 0))
+                ).grid(row=2, column=0, sticky="w", pady=(1, 0))
                 bar_style = {
                     "drive": "Drive.Horizontal.TProgressbar",
                     "r2": "R2.Horizontal.TProgressbar",
                     "local": "Local.Horizontal.TProgressbar",
                 }[name]
-                self.capacity_bars[name] = ttk.Progressbar(
+                bar_slot = ttk.Frame(
                     cell,
+                    style="Surface.TFrame",
+                    height=9,
+                )
+                self.capacity_bars[name] = ttk.Progressbar(
+                    bar_slot,
                     style=bar_style,
                     mode="determinate",
                     maximum=100,
                 )
-                self.capacity_bars[name].grid(
-                    row=4, column=0, sticky="ew", pady=(5, 0)
+                bar_slot.grid(
+                    row=3, column=0, sticky="ew", pady=(5, 0)
                 )
+                bar_slot.pack_propagate(False)
+                self.capacity_bars[name].pack(fill="both", expand=True)
             if index < 3:
-                ttk.Separator(metrics, orient="vertical").grid(
+                ttk.Separator(
+                    metrics,
+                    orient="vertical",
+                    style="Metrics.Vertical.TSeparator",
+                ).grid(
                     row=0,
                     column=index * 2 + 1,
                     sticky="ns",
@@ -1184,18 +1163,21 @@ class ArchiveClientApp(tk.Tk):
         self.table.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
 
-        status_bar = ttk.Frame(
-            self.archive_tab,
-            style="Surface.TFrame",
-            padding=(12, 9),
-        )
-        status_bar.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        status_bar = ttk.Frame(self.archive_tab, style="Surface.TFrame")
+        status_bar.grid(row=4, column=0, sticky="ew", pady=(6, 0))
         status_bar.columnconfigure(0, weight=1)
-        status_text = ttk.Frame(status_bar, style="Surface.TFrame")
-        status_text.grid(row=0, column=0, sticky="ew", padx=(0, 18))
+        status_line = ttk.Frame(
+            status_bar,
+            style="Surface.TFrame",
+            padding=(12, 6, 12, 5),
+        )
+        status_line.grid(row=0, column=0, sticky="ew")
+        status_line.columnconfigure(0, weight=1)
+        status_text = ttk.Frame(status_line, style="Surface.TFrame")
+        status_text.grid(row=0, column=0, sticky="w")
         self.status_var = tk.StringVar(value="正在连接")
         ttk.Label(status_text, textvariable=self.status_var, style="Status.TLabel").pack(
-            anchor="w"
+            side="left"
         )
         self.progress_detail_var = tk.StringVar()
         ttk.Label(
@@ -1203,23 +1185,19 @@ class ArchiveClientApp(tk.Tk):
             textvariable=self.progress_detail_var,
             style="MetricName.TLabel",
             anchor="w",
-        ).pack(anchor="w", pady=(3, 0))
-        progress_area = ttk.Frame(status_bar, style="Surface.TFrame")
-        progress_area.grid(row=0, column=1, sticky="e")
+        ).pack(side="left", padx=(10, 0))
         self.progress_percent_var = tk.StringVar()
         ttk.Label(
-            progress_area,
+            status_line,
             textvariable=self.progress_percent_var,
             style="Percent.TLabel",
             anchor="e",
-            width=36,
-        ).pack(anchor="e")
+        ).grid(row=0, column=1, sticky="e", padx=(12, 0))
         self.progress = ttk.Progressbar(
-            progress_area,
+            status_bar,
             mode="determinate",
-            length=260,
         )
-        self.progress.pack(anchor="e", pady=(3, 0))
+        self.progress.grid(row=1, column=0, sticky="ew")
 
         self.settings_panel: SettingsPanel | None = None
         self._mount_settings_panel(self.config_value)
@@ -1804,12 +1782,6 @@ class ArchiveClientApp(tk.Tk):
         for name in ("drive", "r2", "local"):
             self.metric_vars[name].set("--")
             self.metric_vars[f"{name}_detail"].set("正在读取")
-        self.identity_label.configure(
-            text=(
-                f"profile={self.config_value.profile_id} · "
-                f"collector={self.config_value.collector_id}"
-            )
-        )
         self._sync_profile_selector()
         self.metric_vars["schedule"].set(self._schedule_summary())
         self.metric_vars["schedule_meta"].set(self._schedule_meta())
