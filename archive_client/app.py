@@ -78,13 +78,13 @@ def compact_name(value: str, limit: int = 40) -> str:
 
 
 STATE_TEXT = {
-    "loading": "读取中",
-    "verified": "已验证",
-    "cleaned": "已清理",
-    "missing": "缺失",
-    "error": "异常",
-    "partial": "下载中断",
-    "unverified": "未验证",
+    "loading": "... 读取中",
+    "verified": "✓ 已验证",
+    "cleaned": "✓ 已清理",
+    "missing": "○ 缺失",
+    "error": "! 异常",
+    "partial": "! 下载中断",
+    "unverified": "? 未验证",
 }
 
 
@@ -691,6 +691,8 @@ class ArchiveClientApp(tk.Tk):
             "TNotebook.Tab",
             background=[("selected", SURFACE), ("active", "#e9eef1")],
             foreground=[("selected", ACCENT), ("active", INK)],
+            padding=[("selected", (16, 8))],
+            expand=[("selected", (0, 0, 0, 0))],
         )
         style.configure("Settings.TNotebook", background=SURFACE, borderwidth=0)
         style.configure(
@@ -705,6 +707,8 @@ class ArchiveClientApp(tk.Tk):
             "Settings.TNotebook.Tab",
             background=[("selected", PALE_BLUE), ("active", "#f0f4f6")],
             foreground=[("selected", ACCENT)],
+            padding=[("selected", (12, 7))],
+            expand=[("selected", (0, 0, 0, 0))],
         )
         style.configure(
             "TLabelframe",
@@ -1766,13 +1770,13 @@ class ArchiveClientApp(tk.Tk):
 
     def _render_row(self, row: ArchiveDayStatus) -> None:
         match_text = (
-            "一致"
+            "✓ 一致"
             if row.replicas_match is True
-            else "不一致"
+            else "! 不一致"
             if row.replicas_match is False
-            else "已核准清理"
+            else "✓ 已核准清理"
             if row.drive.state == "cleaned" and row.r2.state == "cleaned"
-            else "读取中"
+            else "... 读取中"
             if "loading" in (row.drive.state, row.r2.state)
             else "--"
         )
