@@ -1038,8 +1038,7 @@ class ArchiveClientApp(tk.Tk):
         )
         style.configure(
             "App.Vertical.TScrollbar",
-            width=12,
-            arrowsize=0,
+            arrowsize=12,
             gripcount=0,
             relief="flat",
             borderwidth=0,
@@ -1074,8 +1073,7 @@ class ArchiveClientApp(tk.Tk):
         )
         style.configure(
             "App.Horizontal.TScrollbar",
-            width=12,
-            arrowsize=0,
+            arrowsize=12,
             gripcount=0,
             relief="flat",
             borderwidth=0,
