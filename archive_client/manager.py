@@ -196,6 +196,15 @@ class ArchiveManager:
     def cleanup_marker_path(self, archive_date: str) -> Path:
         return self.final_root(archive_date) / ".smsi-cloud-cleaned.json"
 
+    def cloud_file_report_dir(self) -> Path:
+        self._require_local_config()
+        return (
+            self.config.archive_root
+            / "reports"
+            / f"collector={self.config.collector_id}"
+            / "cloud-file-operations"
+        )
+
     @staticmethod
     def _read_json_object(path: Path, label: str) -> dict[str, Any]:
         try:
@@ -541,6 +550,83 @@ class ArchiveManager:
             usage.setdefault(name, {"error": "容量统计没有返回结果"})
         usage.setdefault("local", {"error": "磁盘容量统计没有返回结果"})
         return rows, errors, usage
+
+    def browse_cloud(
+        self, provider: str, relative_dir: str = ""
+    ) -> list[dict[str, Any]]:
+        if provider == "google_drive":
+            remote = self.drive
+        elif provider == "r2":
+            remote = self.r2
+        else:
+            raise ValueError("网盘类型无效")
+        return remote.list_entries(relative_dir)
+
+    def prepare_r2_file_delete(
+        self, relative_path: str, is_dir: bool
+    ) -> dict[str, Any]:
+        with self._local_operation_lock("R2 删除预检"):
+            prepare = getattr(self.r2, "prepare_delete", None)
+            if not callable(prepare):
+                raise RuntimeError("Cloudflare R2 当前连接不支持删除")
+            remote_plan = prepare(relative_path, is_dir)
+            now = datetime.now(timezone.utc)
+            stamp = now.strftime("%Y%m%dT%H%M%S.%fZ")
+            plan = {
+                "contract_version": "smsi-cloud-file-delete-plan/v1",
+                "status": "awaiting_confirmation",
+                "profile_id": self.config.profile_id,
+                "collector_id": self.config.collector_id,
+                **remote_plan,
+                "generated_at": now,
+            }
+            plan_path = (
+                self.cloud_file_report_dir()
+                / f"plan-r2-{stamp}.json"
+            )
+            write_json_atomic(plan_path, plan)
+            plan["report_path"] = str(plan_path)
+            return plan
+
+    def execute_r2_file_delete(self, plan_path: Path) -> dict[str, Any]:
+        with self._local_operation_lock("R2 文件删除"):
+            plan_path = Path(plan_path).expanduser().resolve()
+            report_root = self.cloud_file_report_dir().resolve()
+            if not plan_path.is_relative_to(report_root):
+                raise RuntimeError("R2 删除计划不属于当前采集配置")
+            plan = self._read_json_object(plan_path, "R2 删除计划")
+            if (
+                plan.get("contract_version")
+                != "smsi-cloud-file-delete-plan/v1"
+                or plan.get("status") != "awaiting_confirmation"
+                or plan.get("profile_id") != self.config.profile_id
+                or plan.get("collector_id") != self.config.collector_id
+                or plan.get("provider") != "r2"
+            ):
+                raise RuntimeError("R2 删除计划与当前采集配置不匹配")
+            execute = getattr(self.r2, "execute_delete", None)
+            if not callable(execute):
+                raise RuntimeError("Cloudflare R2 当前连接不支持删除")
+            result = execute(plan)
+            now = datetime.now(timezone.utc)
+            stamp = now.strftime("%Y%m%dT%H%M%S.%fZ")
+            receipt = {
+                "contract_version": "smsi-cloud-file-delete-receipt/v1",
+                "status": "completed",
+                "profile_id": self.config.profile_id,
+                "collector_id": self.config.collector_id,
+                **result,
+                "plan_file": plan_path.name,
+                "plan_sha256": sha256_file(plan_path),
+                "completed_at": now,
+            }
+            receipt_path = (
+                self.cloud_file_report_dir()
+                / f"receipt-r2-{stamp}.json"
+            )
+            write_json_atomic(receipt_path, receipt)
+            receipt["report_path"] = str(receipt_path)
+            return receipt
 
     def latest_cleanup_plan(self, archive_date: str) -> Path | None:
         archive_date = validate_archive_date(archive_date)

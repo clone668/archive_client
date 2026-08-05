@@ -5,8 +5,8 @@
 
 Windows 本地双云端归档管理器。它可以同时管理多台采集服务器，每台服务器
 独立绑定 Google Drive、Cloudflare R2 和本机凭据，按 UTC 日期下载 SMSI V3
-归档并执行完整恢复校验。客户端连接始终只读，不持有删除权限，也不会调用云端
-删除 API。
+归档并执行完整恢复校验。Google Drive 保持只读；Cloudflare R2 可使用目标 Bucket
+的读写 Token，在主窗口“网盘”页浏览并删除选中的文件或目录。
 
 ## 功能
 
@@ -21,9 +21,12 @@ Windows 本地双云端归档管理器。它可以同时管理多台采集服务
 - 归档、报告与设置使用同一个主窗口选项卡；操作结果、连接测试和配置校验都在当前
   页面内显示，不再用额外窗口打断操作。
 - 在设置中分别测试 Google Drive 与 R2 连接，并显示 R2 凭据保存状态。
+- “网盘”页面可切换 Google Drive / Cloudflare R2、逐级浏览当前 collector 的文件；
+  R2 支持删除选中的单个文件或目录，并在页内显示精确目标、对象数和容量后确认。
 - 比较两个云端的原始 `manifest.json`，拒绝不一致的双副本。
 - Google Drive 使用 `rclone` OAuth；R2 使用 S3 兼容 API。
-- R2 密钥保存到 Windows 凭据管理器，不写入 `config.json`。
+- R2 密钥保存到 Windows 凭据管理器，不写入 `config.json`；如需客户端删除，现有
+  Token 必须具备目标 Bucket 的 `Object Read & Write` 权限。
 - 下载写入 `.partial`，完整校验后原子改名为正式日期目录。
 - 默认并行下载 4 个归档对象，可在“同步策略”中设置为 1–8；下载前并行读取
   双云端 manifest，并在启动传输前检查本地剩余空间。
@@ -63,8 +66,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 1. 打开“设置”。
 2. 第一台服务器可保持 remote 为 `gdrive:`，点击“配置 OAuth”。
 3. 在 rclone 控制台中新建对应 Google 账号的 Google Drive remote。
-4. 在 Cloudflare 创建仅限 `smsi-archive-tencent-paper` 的 Object Read
-   Token。
+4. 在 Cloudflare 创建仅限 `smsi-archive-tencent-paper` 的 Object Read & Write
+   Token；不需要客户端删除时也可只授予 Object Read。
 5. 填写 R2 Endpoint、Access Key ID 和 Secret Access Key。
 6. 分别点击两个“测试连接”，确认都显示连接成功。R2 密钥输入框留空时，
    测试会使用 Windows 凭据管理器中已保存的密钥。
@@ -81,7 +84,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 服务器 2: gdrive-tencent-report:
 ```
 
-每个配置分别填写自己的 R2 Endpoint、Bucket 和只读 Token。R2 密钥按配置 ID
+每个配置分别填写自己的 R2 Endpoint、Bucket 和 Bucket 级 Token。R2 密钥按配置 ID
 分别保存在 Windows 凭据管理器中。客户端只比较同一配置内部的 Drive/R2
 manifest，不会跨服务器比较或回退。取消勾选“参与同步全部与 Windows 自动任务”
 可让某个配置保留在界面中但不参与后台批量同步。

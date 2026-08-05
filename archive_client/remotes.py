@@ -30,6 +30,41 @@ METADATA_SUFFIX = ".smsi-metadata.json"
 USAGE_CACHE_SECONDS = 300
 
 
+def validate_browser_path(value: Any, *, allow_empty: bool = True) -> str:
+    path_text = str(value or "").strip("/")
+    if not path_text:
+        if allow_empty:
+            return ""
+        raise RuntimeError("不能删除网盘根目录")
+    path = PurePosixPath(path_text)
+    if (
+        not path.parts
+        or path_text == "."
+        or path.is_absolute()
+        or ".." in path.parts
+        or "\\" in path_text
+    ):
+        raise RuntimeError("网盘路径不安全")
+    return path.as_posix()
+
+
+def join_browser_path(parent: str, child: str) -> str:
+    parent = validate_browser_path(parent)
+    child = validate_browser_path(child, allow_empty=False)
+    if "/" in child:
+        raise RuntimeError("网盘条目名称无效")
+    return "/".join(part for part in (parent, child) if part)
+
+
+def remote_timestamp(value: Any) -> str:
+    if value is None:
+        return ""
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        return str(isoformat())
+    return str(value)
+
+
 def resolve_rclone_binary(configured: str) -> str | None:
     value = configured.strip() or "rclone"
     resolved = shutil.which(value)
@@ -170,6 +205,9 @@ class ArchiveRemote(ABC):
     def invalidate_usage_cache(self) -> None:
         return None
 
+    def list_entries(self, relative_dir: str = "") -> list[dict[str, Any]]:
+        raise RuntimeError(f"{self.name} 不支持文件浏览")
+
 
 class UnavailableRemote(ArchiveRemote):
     def __init__(self, name: str, reason: str) -> None:
@@ -207,6 +245,10 @@ class UnavailableRemote(ArchiveRemote):
     def storage_usage(self) -> dict[str, Any]:
         self._raise()
         return {}
+
+    def list_entries(self, relative_dir: str = "") -> list[dict[str, Any]]:
+        self._raise()
+        return []
 
 
 class DriveRemote(ArchiveRemote):
@@ -264,6 +306,40 @@ class DriveRemote(ArchiveRemote):
             if match:
                 dates.add(match.group(1))
         return dates
+
+    def list_entries(self, relative_dir: str = "") -> list[dict[str, Any]]:
+        relative_dir = validate_browser_path(relative_dir)
+        result = self._run(
+            ["lsjson", self._remote_path(relative_dir), "--max-depth", "1"],
+            timeout=120,
+        )
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Google Drive 文件清单不是有效 JSON") from exc
+        if not isinstance(payload, list):
+            raise RuntimeError("Google Drive 文件清单结构无效")
+        entries: list[dict[str, Any]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                raise RuntimeError("Google Drive 文件清单条目无效")
+            name = str(item.get("Name") or item.get("Path") or "").strip("/")
+            if not name or "/" in name or "\\" in name:
+                raise RuntimeError("Google Drive 返回了无效条目名称")
+            is_dir = bool(item.get("IsDir"))
+            size = 0 if is_dir else int(item.get("Size", -1))
+            if size < 0:
+                raise RuntimeError("Google Drive 返回了无效文件大小")
+            entries.append(
+                {
+                    "path": join_browser_path(relative_dir, name),
+                    "name": name,
+                    "is_dir": is_dir,
+                    "size_bytes": size,
+                    "modified": remote_timestamp(item.get("ModTime")),
+                }
+            )
+        return sorted(entries, key=lambda item: (not item["is_dir"], item["name"].casefold()))
 
     def storage_usage(self) -> dict[str, Any]:
         now = time.monotonic()
@@ -494,6 +570,152 @@ class R2Remote(ArchiveRemote):
                 if match:
                     dates.add(match.group(1))
         return dates
+
+    def list_entries(self, relative_dir: str = "") -> list[dict[str, Any]]:
+        relative_dir = validate_browser_path(relative_dir)
+        prefix = self._key(relative_dir).rstrip("/") + "/"
+        entries: dict[str, dict[str, Any]] = {}
+        paginator = self.client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(
+            Bucket=self.config.r2_bucket, Prefix=prefix, Delimiter="/"
+        ):
+            for item in page.get("CommonPrefixes") or []:
+                full_prefix = str(item.get("Prefix") or "")
+                name = full_prefix.removeprefix(prefix).strip("/")
+                if not name or "/" in name or "\\" in name:
+                    raise RuntimeError("Cloudflare R2 返回了无效目录名称")
+                path = join_browser_path(relative_dir, name)
+                entries[path] = {
+                    "path": path,
+                    "name": name,
+                    "is_dir": True,
+                    "size_bytes": 0,
+                    "modified": "",
+                }
+            for item in page.get("Contents") or []:
+                key = str(item.get("Key") or "")
+                if key == prefix:
+                    continue
+                name = key.removeprefix(prefix)
+                if not name or "/" in name or "\\" in name:
+                    raise RuntimeError("Cloudflare R2 返回了无效文件名称")
+                path = join_browser_path(relative_dir, name)
+                size = int(item.get("Size", -1))
+                if size < 0:
+                    raise RuntimeError("Cloudflare R2 返回了无效文件大小")
+                entries[path] = {
+                    "path": path,
+                    "name": name,
+                    "is_dir": False,
+                    "size_bytes": size,
+                    "modified": remote_timestamp(item.get("LastModified")),
+                }
+        return sorted(
+            entries.values(),
+            key=lambda item: (not item["is_dir"], item["name"].casefold()),
+        )
+
+    def _delete_objects_for(
+        self, relative_path: str, is_dir: bool
+    ) -> dict[str, int]:
+        relative_path = validate_browser_path(relative_path, allow_empty=False)
+        target = self._key(relative_path)
+        prefix = target.rstrip("/") + "/" if is_dir else target
+        objects: dict[str, int] = {}
+        paginator = self.client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(
+            Bucket=self.config.r2_bucket, Prefix=prefix
+        ):
+            for item in page.get("Contents") or []:
+                key = str(item.get("Key") or "")
+                if (is_dir and not key.startswith(prefix)) or (
+                    not is_dir and key != target
+                ):
+                    continue
+                size = int(item.get("Size", -1))
+                if size < 0 or key in objects:
+                    raise RuntimeError("Cloudflare R2 删除清单包含无效对象")
+                objects[key] = size
+        if not objects:
+            kind = "目录" if is_dir else "文件"
+            raise RuntimeError(f"所选{kind}已不存在或为空")
+        return objects
+
+    def prepare_delete(
+        self, relative_path: str, is_dir: bool
+    ) -> dict[str, Any]:
+        relative_path = validate_browser_path(relative_path, allow_empty=False)
+        objects = self._delete_objects_for(relative_path, bool(is_dir))
+        return {
+            "provider": "r2",
+            "path": relative_path,
+            "is_dir": bool(is_dir),
+            "object_count": len(objects),
+            "total_bytes": sum(objects.values()),
+            "expected_objects": objects,
+            "target": (
+                f"s3://{self.config.r2_bucket}/{self._key(relative_path)}"
+                + ("/" if is_dir else "")
+            ),
+        }
+
+    def execute_delete(self, plan: dict[str, Any]) -> dict[str, Any]:
+        relative_path = validate_browser_path(
+            plan.get("path"), allow_empty=False
+        )
+        is_dir = bool(plan.get("is_dir"))
+        expected_raw = plan.get("expected_objects")
+        if not isinstance(expected_raw, dict):
+            raise RuntimeError("R2 删除计划缺少精确对象清单")
+        expected = {str(key): int(size) for key, size in expected_raw.items()}
+        observed = self._delete_objects_for(relative_path, is_dir)
+        if observed != expected:
+            raise RuntimeError("所选路径内容在确认期间发生变化，已停止删除")
+        keys = sorted(observed)
+        for offset in range(0, len(keys), 1000):
+            response = self.client.delete_objects(
+                Bucket=self.config.r2_bucket,
+                Delete={
+                    "Objects": [
+                        {"Key": key} for key in keys[offset : offset + 1000]
+                    ],
+                    "Quiet": True,
+                },
+            )
+            errors = response.get("Errors") or []
+            if errors:
+                first = errors[0]
+                raise RuntimeError(
+                    "Cloudflare R2 删除失败："
+                    f"{first.get('Key', '')} {first.get('Code', '')} "
+                    f"{first.get('Message', '')}".strip()
+                )
+        target = self._key(relative_path)
+        prefix = target.rstrip("/") + "/" if is_dir else target
+        remaining: list[str] = []
+        paginator = self.client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(
+            Bucket=self.config.r2_bucket, Prefix=prefix
+        ):
+            for item in page.get("Contents") or []:
+                key = str(item.get("Key") or "")
+                if (is_dir and key.startswith(prefix)) or (
+                    not is_dir and key == target
+                ):
+                    remaining.append(key)
+        if remaining:
+            raise RuntimeError(
+                f"删除后仍有 {len(remaining)} 个目标对象，未记录为完成"
+            )
+        self.invalidate_usage_cache()
+        return {
+            "provider": "r2",
+            "path": relative_path,
+            "is_dir": is_dir,
+            "deleted_objects": len(observed),
+            "deleted_bytes": sum(observed.values()),
+            "target": plan.get("target"),
+        }
 
     def storage_usage(self) -> dict[str, Any]:
         now = time.monotonic()

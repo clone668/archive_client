@@ -90,6 +90,61 @@ STATE_TEXT = {
 }
 
 
+class AutoHideScrollbar(ttk.Scrollbar):
+    """Hide the scrollbar until its connected view can actually scroll."""
+
+    def __init__(self, parent: tk.Widget, **kwargs: Any) -> None:
+        orient = str(kwargs.get("orient", "vertical"))
+        kwargs.setdefault(
+            "style",
+            "App.Horizontal.TScrollbar"
+            if orient == "horizontal"
+            else "App.Vertical.TScrollbar",
+        )
+        super().__init__(parent, **kwargs)
+        self._scroll_required = False
+        self._shown = False
+        self._visibility_job: str | None = None
+
+    def grid(self, *args: Any, **kwargs: Any) -> None:
+        super().grid(*args, **kwargs)
+        self._shown = True
+        self._schedule_visibility_update()
+
+    def set(self, first: str | float, last: str | float) -> None:
+        super().set(first, last)
+        try:
+            self._scroll_required = float(first) > 0.0 or float(last) < 1.0
+        except (TypeError, ValueError):
+            self._scroll_required = True
+        self._schedule_visibility_update()
+
+    def destroy(self) -> None:
+        if self._visibility_job is not None:
+            try:
+                self.after_cancel(self._visibility_job)
+            except tk.TclError:
+                pass
+            self._visibility_job = None
+        super().destroy()
+
+    def _schedule_visibility_update(self) -> None:
+        if self._visibility_job is None:
+            self._visibility_job = self.after_idle(self._apply_visibility)
+
+    def _apply_visibility(self) -> None:
+        self._visibility_job = None
+        try:
+            if self._scroll_required and not self._shown:
+                super().grid()
+                self._shown = True
+            elif not self._scroll_required and self._shown:
+                super().grid_remove()
+                self._shown = False
+        except tk.TclError:
+            return
+
+
 class ThinProgressbar(tk.Canvas):
     def __init__(
         self,
@@ -964,6 +1019,78 @@ class ArchiveClientApp(tk.Tk):
             relief="flat",
         )
         style.map("Treeview.Heading", background=[("active", "#dde5ea")])
+        style.layout(
+            "App.Vertical.TScrollbar",
+            [
+                (
+                    "Vertical.Scrollbar.trough",
+                    {
+                        "sticky": "ns",
+                        "children": [
+                            (
+                                "Vertical.Scrollbar.thumb",
+                                {"expand": "1", "sticky": "nswe"},
+                            )
+                        ],
+                    },
+                )
+            ],
+        )
+        style.configure(
+            "App.Vertical.TScrollbar",
+            width=8,
+            arrowsize=0,
+            gripcount=0,
+            relief="flat",
+            borderwidth=0,
+            troughcolor="#edf1f4",
+            background="#b7c3cc",
+            bordercolor="#edf1f4",
+            lightcolor="#b7c3cc",
+            darkcolor="#b7c3cc",
+        )
+        style.map(
+            "App.Vertical.TScrollbar",
+            background=[("pressed", ACCENT), ("active", "#8fa1ad")],
+            lightcolor=[("pressed", ACCENT), ("active", "#8fa1ad")],
+            darkcolor=[("pressed", ACCENT), ("active", "#8fa1ad")],
+        )
+        style.layout(
+            "App.Horizontal.TScrollbar",
+            [
+                (
+                    "Horizontal.Scrollbar.trough",
+                    {
+                        "sticky": "ew",
+                        "children": [
+                            (
+                                "Horizontal.Scrollbar.thumb",
+                                {"expand": "1", "sticky": "nswe"},
+                            )
+                        ],
+                    },
+                )
+            ],
+        )
+        style.configure(
+            "App.Horizontal.TScrollbar",
+            width=8,
+            arrowsize=0,
+            gripcount=0,
+            relief="flat",
+            borderwidth=0,
+            troughcolor="#edf1f4",
+            background="#b7c3cc",
+            bordercolor="#edf1f4",
+            lightcolor="#b7c3cc",
+            darkcolor="#b7c3cc",
+        )
+        style.map(
+            "App.Horizontal.TScrollbar",
+            background=[("pressed", ACCENT), ("active", "#8fa1ad")],
+            lightcolor=[("pressed", ACCENT), ("active", "#8fa1ad")],
+            darkcolor=[("pressed", ACCENT), ("active", "#8fa1ad")],
+        )
         for name, color in (
             ("Drive", "#4285f4"),
             ("R2", "#f48120"),
@@ -997,9 +1124,11 @@ class ArchiveClientApp(tk.Tk):
         self.main_notebook.grid(row=0, column=0, sticky="nsew")
         self.archive_tab = ttk.Frame(self.main_notebook)
         self.report_tab = ttk.Frame(self.main_notebook)
+        self.cloud_tab = ttk.Frame(self.main_notebook)
         self.settings_tab = ttk.Frame(self.main_notebook)
         self.main_notebook.add(self.archive_tab, text="归档")
         self.main_notebook.add(self.report_tab, text="报告")
+        self.main_notebook.add(self.cloud_tab, text="网盘")
         self.main_notebook.add(self.settings_tab, text="设置")
         self.archive_tab.columnconfigure(0, weight=1)
         self.archive_tab.rowconfigure(3, weight=1)
@@ -1253,7 +1382,7 @@ class ArchiveClientApp(tk.Tk):
         self.table.tag_configure("loading", foreground=BLUE, background=PALE_BLUE)
         self.table.tag_configure("warn", foreground=AMBER, background=PALE_AMBER)
         self.table.tag_configure("error", foreground=RED, background=PALE_RED)
-        scrollbar = ttk.Scrollbar(
+        scrollbar = AutoHideScrollbar(
             self.table_frame, orient="vertical", command=self.table.yview
         )
         self.table.configure(yscrollcommand=scrollbar.set)
@@ -1303,6 +1432,7 @@ class ArchiveClientApp(tk.Tk):
         self.progress.pack(fill="both", expand=True)
 
         self._build_report_tab()
+        self._build_cloud_tab()
         self.settings_panel: SettingsPanel | None = None
         self._mount_settings_panel(self.config_value)
         self.main_notebook.bind("<<NotebookTabChanged>>", self._on_main_tab_changed)
@@ -1377,7 +1507,7 @@ class ArchiveClientApp(tk.Tk):
         self.report_table.tag_configure("ok", foreground=INK)
         self.report_table.tag_configure("warn", foreground=AMBER)
         self.report_table.tag_configure("error", foreground=RED)
-        report_scrollbar = ttk.Scrollbar(
+        report_scrollbar = AutoHideScrollbar(
             report_list_frame,
             orient="vertical",
             command=self.report_table.yview,
@@ -1422,7 +1552,7 @@ class ArchiveClientApp(tk.Tk):
             show="headings",
             selectmode="browse",
         )
-        detail_scrollbar = ttk.Scrollbar(
+        detail_scrollbar = AutoHideScrollbar(
             detail_frame,
             orient="vertical",
             command=self.report_detail_table.yview,
@@ -1444,15 +1574,363 @@ class ArchiveClientApp(tk.Tk):
 
         self.refresh_reports()
 
+    def _build_cloud_tab(self) -> None:
+        self.cloud_tab.columnconfigure(0, weight=1)
+        self.cloud_tab.rowconfigure(2, weight=1)
+        self.cloud_provider = "r2"
+        self.cloud_current_dir = ""
+        self.cloud_entries: dict[str, dict[str, Any]] = {}
+        self.cloud_loaded = False
+        self.cloud_delete_plan_path: Path | None = None
+        self.cloud_post_refresh_message = ""
+        self.cloud_path_var = tk.StringVar()
+        self.cloud_status_var = tk.StringVar(
+            value="进入本页后读取当前 collector 的网盘文件。"
+        )
+        self.cloud_progress_var = tk.StringVar()
+
+        toolbar = ttk.Frame(self.cloud_tab, padding=(10, 10, 10, 8))
+        toolbar.grid(row=0, column=0, sticky="ew")
+        toolbar.columnconfigure(3, weight=1)
+        self.cloud_provider_buttons: dict[str, ttk.Button] = {}
+        for column, (provider, label) in enumerate(
+            (("google_drive", "Google Drive"), ("r2", "Cloudflare R2"))
+        ):
+            button = ttk.Button(
+                toolbar,
+                text=label,
+                command=lambda value=provider: self.set_cloud_provider(value),
+            )
+            button.grid(row=0, column=column, padx=(0, 6))
+            self.cloud_provider_buttons[provider] = button
+        self.cloud_back_button = ttk.Button(
+            toolbar, text="← 上一级", command=self.cloud_go_back, state="disabled"
+        )
+        self.cloud_back_button.grid(row=0, column=2, padx=(8, 8))
+        ttk.Label(
+            toolbar,
+            textvariable=self.cloud_path_var,
+            style="MetricName.TLabel",
+            anchor="w",
+        ).grid(row=0, column=3, sticky="ew")
+        self.cloud_refresh_button = ttk.Button(
+            toolbar, text="↻ 刷新", command=self.refresh_cloud
+        )
+        self.cloud_refresh_button.grid(row=0, column=4, padx=(8, 0))
+        self._render_cloud_provider_buttons()
+        self._render_cloud_path()
+
+        note = ttk.Frame(
+            self.cloud_tab, style="Surface.TFrame", padding=(12, 7)
+        )
+        note.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 7))
+        note.columnconfigure(0, weight=1)
+        self.cloud_note_var = tk.StringVar()
+        ttk.Label(
+            note,
+            textvariable=self.cloud_note_var,
+            style="Muted.TLabel",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+        self.cloud_delete_button = ttk.Button(
+            note,
+            text="⌫ 删除选中",
+            style="Danger.TButton",
+            command=self.prepare_cloud_delete,
+            state="disabled",
+        )
+        self.cloud_delete_button.grid(row=0, column=1, padx=(10, 0))
+        self._render_cloud_note()
+
+        table_frame = ttk.Frame(self.cloud_tab, style="Surface.TFrame")
+        table_frame.grid(row=2, column=0, sticky="nsew", padx=10)
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+        columns = ("name", "type", "size", "modified")
+        self.cloud_table = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+        )
+        headings = {
+            "name": "名称",
+            "type": "类型",
+            "size": "大小",
+            "modified": "修改时间",
+        }
+        widths = {"name": 480, "type": 90, "size": 120, "modified": 220}
+        for column in columns:
+            self.cloud_table.heading(column, text=headings[column], anchor="w")
+            self.cloud_table.column(
+                column,
+                width=widths[column],
+                minwidth=80,
+                anchor="w",
+                stretch=column == "name",
+            )
+        self.cloud_table.tag_configure("stripe_even", background=SURFACE)
+        self.cloud_table.tag_configure("stripe_odd", background="#f5f7f9")
+        scrollbar = AutoHideScrollbar(
+            table_frame, orient="vertical", command=self.cloud_table.yview
+        )
+        self.cloud_table.configure(yscrollcommand=scrollbar.set)
+        self.cloud_table.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.cloud_table.bind("<<TreeviewSelect>>", self._on_cloud_selection)
+        self.cloud_table.bind("<Double-1>", self.open_cloud_selected)
+
+        self.cloud_confirm_frame = ttk.Frame(
+            self.cloud_tab, style="Surface.TFrame", padding=(12, 8)
+        )
+        self.cloud_confirm_frame.grid(
+            row=3, column=0, sticky="ew", padx=10, pady=(7, 0)
+        )
+        self.cloud_confirm_frame.columnconfigure(0, weight=1)
+        self.cloud_confirm_var = tk.StringVar()
+        ttk.Label(
+            self.cloud_confirm_frame,
+            textvariable=self.cloud_confirm_var,
+            style="MetricName.TLabel",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Button(
+            self.cloud_confirm_frame,
+            text="取消",
+            command=self.cancel_cloud_delete,
+        ).grid(row=0, column=1, padx=(10, 6))
+        self.cloud_confirm_button = ttk.Button(
+            self.cloud_confirm_frame,
+            text="⌫ 确认删除",
+            style="Danger.TButton",
+            command=self.confirm_cloud_delete,
+        )
+        self.cloud_confirm_button.grid(row=0, column=2)
+        self.cloud_confirm_frame.grid_remove()
+
+        status = ttk.Frame(
+            self.cloud_tab, style="Surface.TFrame", padding=(12, 7, 12, 6)
+        )
+        status.grid(row=4, column=0, sticky="ew", padx=10, pady=(7, 7))
+        status.columnconfigure(0, weight=1)
+        self.cloud_status_label = ttk.Label(
+            status,
+            textvariable=self.cloud_status_var,
+            style="MetricName.TLabel",
+            anchor="w",
+        )
+        self.cloud_status_label.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            status,
+            textvariable=self.cloud_progress_var,
+            style="Percent.TLabel",
+            anchor="e",
+        ).grid(row=0, column=1, sticky="e", padx=(10, 0))
+        cloud_progress_slot = ttk.Frame(
+            status, style="Surface.TFrame", height=3
+        )
+        cloud_progress_slot.grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0)
+        )
+        cloud_progress_slot.pack_propagate(False)
+        self.cloud_progress = ThinProgressbar(cloud_progress_slot)
+        self.cloud_progress.pack(fill="both", expand=True)
+
+    def _set_cloud_status(self, message: str, severity: str = "info") -> None:
+        self.cloud_status_var.set(message)
+        color = {
+            "success": GREEN,
+            "warning": AMBER,
+            "error": RED,
+        }.get(severity, MUTED)
+        self.cloud_status_label.configure(foreground=color)
+
+    def _render_cloud_provider_buttons(self) -> None:
+        for provider, button in self.cloud_provider_buttons.items():
+            button.configure(
+                style="Primary.TButton" if provider == self.cloud_provider else "TButton"
+            )
+
+    def _render_cloud_note(self) -> None:
+        if self.cloud_provider == "r2":
+            self.cloud_note_var.set(
+                "R2 使用设置页现有凭据；删除需要该 Token 具备目标 Bucket 的 Object Read & Write 权限。"
+            )
+        else:
+            self.cloud_note_var.set(
+                "Google Drive 使用当前只读 OAuth，可浏览和下载，不能在此删除。"
+            )
+
+    def _render_cloud_path(self) -> None:
+        suffix = f" / {self.cloud_current_dir}" if self.cloud_current_dir else ""
+        self.cloud_path_var.set(
+            f"位置：collector={self.config_value.collector_id}{suffix}"
+        )
+
+    def set_cloud_provider(self, provider: str) -> None:
+        if self.busy or provider == self.cloud_provider:
+            return
+        self.cloud_provider = provider
+        self.cloud_current_dir = ""
+        self._render_cloud_provider_buttons()
+        self._render_cloud_note()
+        self._render_cloud_path()
+        self.refresh_cloud()
+
+    def _hide_cloud_confirmation(self) -> None:
+        self.cloud_delete_plan_path = None
+        self.cloud_confirm_var.set("")
+        self.cloud_confirm_frame.grid_remove()
+
+    def refresh_cloud(self) -> None:
+        if self.busy:
+            return
+        provider = self.cloud_provider
+        relative_dir = self.cloud_current_dir
+        self._hide_cloud_confirmation()
+        self.cloud_entries.clear()
+        self.cloud_table.delete(*self.cloud_table.get_children())
+        self._begin_operation("cloud_browse", cancelable=False)
+        self._set_busy(True, f"正在读取 {replica_label(provider)} 文件")
+        self.cloud_progress.configure(mode="indeterminate", value=10, maximum=100)
+        self.cloud_progress.start(24)
+        self.cloud_progress_var.set("")
+        self._set_cloud_status("正在读取当前目录")
+
+        def run() -> None:
+            try:
+                entries = self.manager.browse_cloud(provider, relative_dir)
+            except Exception as exc:
+                LOGGER.exception("Cloud browser listing failed")
+                self.events.put(("cloud_error", exc))
+            else:
+                self.events.put(
+                    ("cloud_list", (provider, relative_dir, entries))
+                )
+
+        thread = threading.Thread(target=run, daemon=True)
+        self._active_thread = thread
+        thread.start()
+
+    def cloud_go_back(self) -> None:
+        if self.busy or not self.cloud_current_dir:
+            return
+        path = self.cloud_current_dir.rsplit("/", 1)
+        self.cloud_current_dir = path[0] if len(path) == 2 else ""
+        self._render_cloud_path()
+        self.refresh_cloud()
+
+    def _selected_cloud_entry(self) -> dict[str, Any] | None:
+        selected = self.cloud_table.selection()
+        if len(selected) != 1:
+            return None
+        return self.cloud_entries.get(selected[0])
+
+    def _on_cloud_selection(self, _event: tk.Event | None = None) -> None:
+        self._hide_cloud_confirmation()
+        self._update_cloud_actions()
+
+    def _update_cloud_actions(self) -> None:
+        entry = self._selected_cloud_entry()
+        enabled = not self.busy and self.cloud_provider == "r2" and entry is not None
+        self.cloud_delete_button.configure(
+            state="normal" if enabled else "disabled"
+        )
+        self.cloud_back_button.configure(
+            state="normal"
+            if not self.busy and bool(self.cloud_current_dir)
+            else "disabled"
+        )
+
+    def open_cloud_selected(self, _event: tk.Event | None = None) -> None:
+        if self.busy:
+            return
+        entry = self._selected_cloud_entry()
+        if not entry or not entry.get("is_dir"):
+            return
+        self.cloud_current_dir = str(entry["path"])
+        self._render_cloud_path()
+        self.refresh_cloud()
+
+    def prepare_cloud_delete(self) -> None:
+        if self.busy or self.cloud_provider != "r2":
+            return
+        entry = self._selected_cloud_entry()
+        if not entry:
+            return
+        self._begin_operation("cloud_delete_prepare", cancelable=False)
+        self._set_busy(True, "正在核对 R2 删除目标")
+        self.cloud_progress.configure(mode="indeterminate", value=10, maximum=100)
+        self.cloud_progress.start(24)
+        self.cloud_progress_var.set("")
+        self._set_cloud_status("正在统计所选路径的精确对象和容量")
+
+        def run() -> None:
+            try:
+                plan = self.manager.prepare_r2_file_delete(
+                    str(entry["path"]), bool(entry["is_dir"])
+                )
+            except Exception as exc:
+                LOGGER.exception("R2 delete preflight failed")
+                self.events.put(("cloud_error", exc))
+            else:
+                self.events.put(("cloud_delete_plan", plan))
+
+        thread = threading.Thread(target=run, daemon=True)
+        self._active_thread = thread
+        thread.start()
+
+    def cancel_cloud_delete(self) -> None:
+        self._hide_cloud_confirmation()
+        self._set_cloud_status("已取消删除确认，未删除任何对象。")
+        self._update_cloud_actions()
+
+    def confirm_cloud_delete(self) -> None:
+        if self.busy or self.cloud_delete_plan_path is None:
+            return
+        plan_path = self.cloud_delete_plan_path
+        self._begin_operation("cloud_delete_execute", cancelable=False)
+        self._set_busy(True, "正在删除 R2 所选路径")
+        self.cloud_progress.stop()
+        self.cloud_progress.configure(mode="indeterminate", value=20, maximum=100)
+        self.cloud_progress.start(24)
+        self.cloud_progress_var.set("")
+        self._set_cloud_status(
+            "正在删除并复查；当前阶段不可取消，关闭窗口会等待完成。",
+            "warning",
+        )
+
+        def run() -> None:
+            try:
+                receipt = self.manager.execute_r2_file_delete(plan_path)
+            except Exception as exc:
+                LOGGER.exception("R2 delete failed")
+                self.events.put(("cloud_error", exc))
+            else:
+                self.events.put(("cloud_delete_complete", receipt))
+
+        thread = threading.Thread(target=run, daemon=True)
+        self._active_thread = thread
+        thread.start()
+
     def _refresh_current_tab(self) -> None:
         if self.main_notebook.select() == str(self.report_tab):
             self.refresh_reports()
+            return
+        if self.main_notebook.select() == str(self.cloud_tab):
+            self.refresh_cloud()
             return
         self.refresh(force=True)
 
     def _on_main_tab_changed(self, _event: tk.Event | None = None) -> None:
         if self.main_notebook.select() == str(self.report_tab):
             self.refresh_reports()
+        elif (
+            self.main_notebook.select() == str(self.cloud_tab)
+            and not self.cloud_loaded
+            and not self.busy
+        ):
+            self.refresh_cloud()
 
     def _report_root(self) -> Path:
         return (
@@ -1963,6 +2441,8 @@ class ArchiveClientApp(tk.Tk):
             self.verify_button,
             self.add_profile_button,
             self.schedule_button,
+            self.cloud_refresh_button,
+            *self.cloud_provider_buttons.values(),
         ):
             button.configure(state=state)
         self._update_download_button_state()
@@ -1981,6 +2461,12 @@ class ArchiveClientApp(tk.Tk):
             self._operation_kind = None
             self._active_cancel = None
             self._active_thread = None
+        self.cloud_confirm_button.configure(
+            state="normal"
+            if not value and self.cloud_delete_plan_path is not None
+            else "disabled"
+        )
+        self._update_cloud_actions()
 
     def _update_download_button_state(self) -> None:
         self.download_button.configure(
@@ -2034,8 +2520,12 @@ class ArchiveClientApp(tk.Tk):
             self.status_var.set("正在安全停止并关闭客户端")
             self.progress_detail_var.set("正在终止传输并保留 .partial 断点数据")
         else:
-            self.status_var.set("正在等待当前只读请求结束后关闭")
-            self.progress_detail_var.set("不会强制中断正在运行的 rclone 请求")
+            if self._operation_kind == "cloud_delete_execute":
+                self.status_var.set("正在等待 R2 删除与复查完成后关闭")
+                self.progress_detail_var.set("不会强制中断正在进行的永久删除")
+            else:
+                self.status_var.set("正在等待当前请求结束后关闭")
+                self.progress_detail_var.set("不会强制中断正在运行的请求")
         self.cancel_button.configure(state="disabled")
         self.after(100, self._wait_for_safe_close)
 
@@ -2380,6 +2870,16 @@ class ArchiveClientApp(tk.Tk):
         self.rows.clear()
         self.usage.clear()
         self.table.delete(*self.table.get_children())
+        self.cloud_provider = "r2"
+        self.cloud_current_dir = ""
+        self.cloud_loaded = False
+        self.cloud_entries.clear()
+        self.cloud_table.delete(*self.cloud_table.get_children())
+        self._hide_cloud_confirmation()
+        self._render_cloud_provider_buttons()
+        self._render_cloud_note()
+        self._render_cloud_path()
+        self._set_cloud_status("切换配置后尚未读取网盘文件。")
         self.refresh_reports()
         for name in ("drive", "r2", "local"):
             self.metric_vars[name].set("--")
@@ -2828,6 +3328,11 @@ class ArchiveClientApp(tk.Tk):
         if self._startup_sync_pending:
             self._startup_sync_pending = False
             self.after(0, self._run_startup_sync)
+        elif (
+            self.main_notebook.select() == str(self.cloud_tab)
+            and not self.cloud_loaded
+        ):
+            self.after(0, self.refresh_cloud)
 
     def _drain_events(self) -> None:
         try:
@@ -2988,6 +3493,106 @@ class ArchiveClientApp(tk.Tk):
                     )
                     self.show_archive_tab()
                     self.refresh()
+                elif event == "cloud_list":
+                    if self._closing:
+                        self.destroy()
+                        return
+                    provider, relative_dir, entries = payload
+                    self.cloud_progress.stop()
+                    self._set_busy(False, "网盘目录读取完成")
+                    self.cloud_progress.configure(
+                        mode="determinate", value=100, maximum=100
+                    )
+                    self.cloud_progress_var.set("100%")
+                    self.cloud_provider = provider
+                    self.cloud_current_dir = relative_dir
+                    self.cloud_loaded = True
+                    self.cloud_entries = {
+                        str(item["path"]): item for item in entries
+                    }
+                    self.cloud_table.delete(*self.cloud_table.get_children())
+                    for index, item in enumerate(entries):
+                        self.cloud_table.insert(
+                            "",
+                            "end",
+                            iid=str(item["path"]),
+                            values=(
+                                ("▣ " if item.get("is_dir") else "")
+                                + str(item.get("name") or ""),
+                                "目录" if item.get("is_dir") else "文件",
+                                ""
+                                if item.get("is_dir")
+                                else human_bytes(int(item.get("size_bytes") or 0)),
+                                str(item.get("modified") or "")[:19].replace(
+                                    "T", " "
+                                ),
+                            ),
+                            tags=(
+                                "stripe_even" if index % 2 == 0 else "stripe_odd",
+                            ),
+                        )
+                    self._render_cloud_provider_buttons()
+                    self._render_cloud_note()
+                    self._render_cloud_path()
+                    self._update_cloud_actions()
+                    message = self.cloud_post_refresh_message
+                    self.cloud_post_refresh_message = ""
+                    self._set_cloud_status(
+                        message
+                        or f"已读取 {len(entries)} 个项目；双击目录可进入。",
+                        "success" if message else "info",
+                    )
+                elif event == "cloud_delete_plan":
+                    if self._closing:
+                        self.destroy()
+                        return
+                    self.cloud_progress.stop()
+                    self._set_busy(False, "R2 删除目标已核对")
+                    self.cloud_progress.configure(
+                        mode="determinate", value=100, maximum=100
+                    )
+                    self.cloud_progress_var.set("100%")
+                    plan = payload
+                    self.cloud_delete_plan_path = Path(plan["report_path"])
+                    kind = "目录" if plan.get("is_dir") else "文件"
+                    self.cloud_confirm_var.set(
+                        f"确认删除{kind}：{plan.get('target')}  ·  "
+                        f"{int(plan.get('object_count') or 0):,} 个对象  ·  "
+                        f"{human_bytes(int(plan.get('total_bytes') or 0))}"
+                    )
+                    self.cloud_confirm_frame.grid()
+                    self.cloud_confirm_button.configure(state="normal")
+                    self._set_cloud_status(
+                        "请核对精确路径和容量；点击确认后将从 R2 永久删除。",
+                        "warning",
+                    )
+                    self.main_notebook.select(self.cloud_tab)
+                elif event == "cloud_delete_complete":
+                    if self._closing:
+                        self.destroy()
+                        return
+                    self.cloud_progress.stop()
+                    self._set_busy(False, "R2 删除完成")
+                    receipt = payload
+                    self._hide_cloud_confirmation()
+                    self.cloud_post_refresh_message = (
+                        f"已删除 {int(receipt.get('deleted_objects') or 0):,} 个对象，"
+                        f"释放 {human_bytes(int(receipt.get('deleted_bytes') or 0))}；"
+                        "审计回执已保存。"
+                    )
+                    self.refresh_reports()
+                    self.refresh_cloud()
+                elif event == "cloud_error":
+                    if self._closing:
+                        self.destroy()
+                        return
+                    self.cloud_progress.stop()
+                    self.cloud_progress.configure(mode="determinate", value=0)
+                    self.cloud_progress_var.set("")
+                    self._set_busy(False, "网盘操作失败")
+                    self._hide_cloud_confirmation()
+                    self._set_cloud_status(str(payload), "error")
+                    self.main_notebook.select(self.cloud_tab)
                 elif event == "operation_cancelled":
                     if self._closing:
                         self.destroy()
